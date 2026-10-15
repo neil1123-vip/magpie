@@ -59,7 +59,8 @@ function serve(lang, posts) {
 
 const strings = [
   "Compaction", "Codex compacts on this provider",
-  "Codex's compaction is asked of this provider as Codex sent it, and the summary it seals goes back to Codex unchanged. Off, magpie writes the summary. A conversation compacted this way continues only on this provider and account: another is refused with an error, never sent without the context.",
+  "When on, Codex's compaction request and the provider's encrypted summary pass through unchanged. The conversation can continue only on the provider and account that made the summary; if unavailable, magpie returns an error without dropping the context.",
+  "When off, magpie generates a text summary. The conversation can then continue through magpie across accounts and providers.",
 ];
 const words = {
   en: { tick: "Codex compacts on this provider", save: "Save" },

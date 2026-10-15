@@ -95,6 +95,43 @@ keys and accounts per request is in [Gateway routing and fallback](gateway-routi
 | A pasted curl command | A curl command from a vendor's docs pasted into a custom provider's Base URL or API key fills the editor in (@mark_li21 on X). `curlOf` reads it as a shell would (lines joined by `\`, cmd's `^` or PowerShell's backtick; `curl.exe`; quotes and escapes), and takes: the API its URL's endpoint names (`…/chat/completions` Chat, `…/messages` Anthropic Messages, `…/responses` Responses) with the base URL before it, spelled as that API wants it (`respellURL`: Anthropic at its root, `/v1` after a bare host); the key from `Authorization: Bearer`, `x-api-key` or `api-key`, unless it only stands for one (`$OPENAI_API_KEY`, `${X}`, `%X%`, `<token>`, `YOUR_API_KEY`), when the key's box is left empty and focused; and the `model` of its JSON body, added to a new provider's models (a saved one's picks are left alone, since adding to none would narrow what it serves). A preset's editor takes only the key. A note (`editorError`, kind `note`) says what was taken, a placeholder like `{WorkspaceId}` left in the URL, and a URL with no known endpoint. Text that isn't a curl command pastes as before, several keys included. Tested on the docs' own examples (`fixtures/curl`). | [`app.js`](../../internal/gui/assets/app.js) (`curlOf`, `fromCurl`), [`provider-curl-paste.test.cjs`](../../internal/gui/tests/provider-curl-paste.test.cjs) |
 | Saved proxies | `settings.Proxies` holds named proxies (`NamedProxy`: id, name, address, optional login), kept in Settings › Network. Wherever a proxy is chosen (global, plugin downloads, app updates, a provider, a key, a Claude account) the value is "" (inherit), `direct`, an address as typed, or `@<id>` for a saved one (@tsingchao on X). Addresses as typed are untouched. App updates take a proxy of their own, Settings › Network › App updates (`settings.UpdateProxy`, `magpie settings set updateProxy <url|direct>`; moonlityu on X: models direct, updates through a proxy): "" follows the global proxy as before, a proxy given to one `magpie update --proxy` run comes first, and it covers the feed, the notes and the release's file (`updateProxy` in [`update.go`](../../internal/update/update.go); `TestUpdateTakesItsOwnProxy`, `settings-update-proxy.test.cjs`). Per-model proxies within one provider are not offered: a proxy belongs to a provider, an account or a key, and a model that needs the other route is a second provider on the same URL. `netproxy.Parse`, `Resolve`, `Redact`, `EnvWith` and `Dispatch` resolve an `@id` at the lowest layer, so an edit reaches every user at the next request; a Claude Code `settings.json` env is a snapshot and is rewritten after an edit (`provider.ProxyEdited`). An `@id` this computer lacks fails closed (`netproxy.DeadProxy`, the request error and the provider row say "Proxy missing: {name}", `provider.ProxyGone`); it never goes direct. The password is written to settings.json (0600) and never read back by the page (nor sent in `/api/state`'s settings, with the LAN key, Bark key and GitHub token: `stateSettings`, `TestStateSendsNoCredentials`), logged or put in `Settings` sync; the list rides with the providers part of a sync (`backup.Bundle.Proxies`, `settings.MergeProxies`, passwords only with keys). A proxy in use cannot be deleted (409). A saved proxy can be an SSH server (`ssh://host:port`, a user, a password and/or a private key; @laiuuui on X, whose VPS gives only SSH): magpie logs in itself with golang.org/x/crypto/ssh, no ssh command, and resolves the `@id` to a SOCKS5 server of its own on loopback (`socks5h://magpie:<random>@127.0.0.1:<port>`, which takes only that login), carrying each CONNECT as a direct-tcpip channel, as `ssh -D` does. It logs in on the first request, keeps the connection with keepalive@openssh.com every 20s (15s with no answer ends it), and logs in again once when a channel finds it dead (`sshTunnel` in [`ssh.go`](../../internal/netproxy/ssh.go)). Save logs in first, so a refused login is said there and nothing is kept; the host key is trusted on first use and kept as `HostKey` (authorized_keys form, the page shows its SHA256 fingerprint), and a server showing another key is refused (`HostKeyChangedError`) until Advanced › Trust a new key. The key is a secret as the password is: `WithoutProxyPasswords`, `MergeProxies`, `KeepSecretsOf`. An `ssh://` typed as an address is refused: its login belongs to a saved proxy. Every request to the server needs it to allow forwarding: macOS 27's sshd hangs up on a forward (also with OpenSSH's own `ssh -W`), and that is said as "won't forward connections" (`SSHForwardWhy`). A failed proxy says why (`netproxy.Why`: an English template the page translates, its `{addr}`, `{was}`, `{now}` filled; `fail` in api.go sends it as `code: proxy_why`, a check as `why`/`addr`): `Explain` reads Go's error, and `ExplainServer`, for a check the user asked for only, reads the server's first bytes when the text can't tell, since Go reads a real OpenSSH banner ("SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20") as an HTTP status line with a bad code. Each save is tested at once. A Test (Settings, and the provider editor's Saved mode) asks Cloudflare's trace page through the proxy, only on a click: its latency runs from the request written to the answer's first byte, so a new connection's dial, tunnel and TLS don't count and a second Test reads like the first, and the exit's region is named in the reader's language (IcyLiqu1d on X). An editor opened before Settings was read draws its picker again once the saved proxies are in. `TestSavedProxyLatencyIsTheRoundTrip`, `provider-proxy-pick-test.test.cjs`, `TestSavedProxyChoice`, `TestDanglingProxyReferenceFailsClosed`, `TestSavedProxiesTravelWithProviders`, `TestSSHProxyCarriesRequests`, `TestSSHProxyRefusesAChangedHostKey`, `TestSSHProxySaysWhyItFailed`, `TestProxyFailureNamesAnSSHServer`, `TestSavedSSHProxyAPI`, `TestSavedSSHProxyThatWontForward` (an SSH server in the test, `netproxy/sshtest`, never the network), `saved-proxies.test.cjs`, `saved-ssh-proxy.test.cjs`, `provider-proxy-missing.test.cjs`. | [`proxies.go`](../../internal/settings/proxies.go), [`netproxy.go`](../../internal/netproxy/netproxy.go), [`ssh.go`](../../internal/netproxy/ssh.go), [`why.go`](../../internal/netproxy/why.go), [`proxies.go`](../../internal/gui/proxies.go) |
 
+## 原生搜索检测
+
+自定义供应商编辑器的“自己能联网搜索”旁有“检测”按钮。
+`POST /api/provider/test-search` 使用当前表单的地址、模型选择、
+请求头、额外请求体、代理和鉴权方式；未重填密钥时沿用已保存供应商
+或复制来源的密钥。新建预设使用其默认端点；明确清空的端点不会回退。
+供应商和每个密钥的代理使用当前草稿，自定义代理缺少地址时不发送请求。
+
+[`Provider.TestSearch`](../../internal/provider/test_search.go) 直接请求
+已配置的 Anthropic Messages 和 Responses 原生搜索工具，每种协议选择
+一个模型和可用密钥，不经过网关的代搜。JSON 和 SSE 响应均检查工具结果：
+Responses 需要已完成的 `web_search_call` 搜索动作；Anthropic 需要匹配的
+服务端搜索调用及含 URL 的搜索结果。普通回答、函数调用或仅宣布调用不会
+判为支持。SSE 还需 Responses 的 `response.completed` 或 Anthropic 的
+`message_stop`；响应限制为 2 MiB，提前结束、失败状态和内嵌错误均不确认。
+没有已选或缓存模型时，临时列表使用该协议所选密钥及其代理，不使用其他
+协议的密钥或端点。HTTP 和流内错误单独显示。结果只代表本次模型、密钥和协议，
+未确认不等于供应商完全不支持。
+
+检测会消耗供应商额度；不会勾选开关、保存配置或记录自动鉴权选择。
+接口沿用 `magpie web` 的访问密钥保护。
+
+## 原生压缩检测
+
+有 Responses 地址的 API 密钥供应商，在“Codex 在此服务商上原生压缩”
+旁提供“检测”。`POST /api/provider/test-compaction` 与搜索检测使用相同的
+草稿表单、密钥和访问保护，不保存配置，也不自动开启原生压缩。
+订阅账号继续使用原有开关，本检测不探测其账号。
+
+[`Provider.TestCompaction`](../../internal/provider/test_compaction.go) 发送
+带 `compaction_trigger` 的短对话到 `/responses`，测试此开关实际使用的
+请求路径。只有 `compaction` 或 `compaction_summary` 含非空
+`encrypted_content` 才确认原生压缩；普通摘要、reasoning、空压缩项和
+magpie 自己的 `magpie1:` 摘要不算。SSE 必须正常完成，HTTP 错误、
+流内错误或提前结束会显示失败。未返回有效内容显示“未确认”，不能据此
+断言整个供应商不支持；结果只代表本次模型和密钥，检测会消耗额度。
+
 ## Remote magpie
 
 The `remote-magpie` preset is of its own kind, `KindRemote` (`remote`), not
