@@ -1751,7 +1751,7 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				Provider providerJSON      `json:"provider"`
 			}{p.Test(ctx), providerInfo(saved, agentUses(agent.Detected(), provider.GroupFinder()))})
 			return
-		case "detect":
+		case "detect", "test-search", "test-compaction":
 			// which APIs answer at the URL typed (Model, or one from the
 			// list for each), the form as it stands: a new provider's,
 			// or a saved one's with its key when none is typed — a copy
@@ -1772,6 +1772,29 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				p = *saved
 			}
 			p = typed(p, in, req.Proxy, req.InsecureTLS)
+			if action := r.PathValue("action"); action == "test-search" || action == "test-compaction" {
+				// Cleared endpoints stay cleared for this test of the form.
+				p.Chat, p.Responses, p.Anthropic, p.Gemini = strings.TrimSpace(in.Chat), strings.TrimSpace(in.Responses), strings.TrimSpace(in.Anthropic), strings.TrimSpace(in.Gemini)
+				p.AuthHeader = in.AuthHeader
+				if in.AccountProxies != nil {
+					p.AccountProxies = in.AccountProxies
+				}
+				ctx, cancel := context.WithTimeout(r.Context(), 100*time.Second)
+				defer cancel()
+				var results []provider.Result
+				var err error
+				if action == "test-compaction" {
+					results, err = p.TestCompaction(ctx, req.Picked)
+				} else {
+					results, err = p.TestSearch(ctx, req.Picked)
+				}
+				if err != nil {
+					fail(rw, err)
+					return
+				}
+				writeJSON(rw, map[string]any{"results": results})
+				return
+			}
 			if strings.TrimSpace(in.Decide) != "" {
 				// a decision API is asked its smallest question, at
 				// POST …/systemone (#647)

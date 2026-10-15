@@ -1777,7 +1777,21 @@ only a Chat address has no such row; it comes once an Anthropic URL is
 typed under More endpoints and goes with it, and Save then posts
 `searches: false`. The row says the relay can be named as the searcher but
 is not picked automatically. A signed-in account (Codex) has no such row.
-Every string has its Chinese; English and Chinese, Chromium and WebKit.
+检测按钮使用当前表单，覆盖等待时禁止重复检测、成功、未确认、协议错误、
+HTTP 错误、额外 JSON 无效及窄窗口布局。检测不勾选开关、不保存配置。
+草稿代理（供应商和每个密钥）及自定义代理缺少地址均有回归覆盖。
+覆盖英、简中、繁中、日、德五种语言及 Chromium、WebKit。
+`MAGPIE_SEARCH_ASSETS` 可指向旧版资源以验证回归用例确实失败。
+`TestProviderSearchDraft` 通过本地服务器验证新建、保存密钥、替换密钥、
+复制来源、清空端点、Web 访问保护和配置不被修改。
+
+`provider-compaction.test.cjs` 验证原生压缩开关旁的检测按钮，覆盖未保存
+表单、重复点击保护、成功、未确认、错误恢复、无效额外 JSON、Responses
+地址的显隐及订阅账号不显示检测按钮。英、简中、繁中、日、德五种语言均
+在 Chromium 和 WebKit 检查桌面与窄窗口；`MAGPIE_COMPACTION_ASSETS`
+可指向缺少功能的资源，验证回归测试会失败。`TestProviderCompactionDraft`
+通过本地服务器验证密钥复用、草稿覆盖、清空端点、Web 访问保护及配置不变。
+新建预设通过实际 Add 路径验证默认 Responses 地址被发送。
 
 `lan-docker.test.cjs` checks Share on local network in a container (Discord:
 magpie in Docker on a NAS showed the container's own 172.17.x address).

@@ -53,6 +53,43 @@ keys and accounts per request is in [Gateway routing and fallback](gateway-routi
 | Local servers | A preset of `KindLocal` (Ollama, LM Studio, oMLX, MLX-Serve) is at its server's default port on this machine. Another address — a port, or another computer — is given in the window's editor, under Server address, or in the TUI (asked on adding, `w` after); on the command line the URLs themselves (`url=`, `anthropic=`, `responses=`). `AtAddress` replaces only each URL's scheme, host and port, each API keeping its path; `AddressOf` is the address an editor starts from. The window sends the URLs moved only when the address was changed, so a Save doesn't move URLs set apart (another app's import). A provider of the user's own (no preset) has `w` in the TUI too: each base URL it has is asked in turn, typed in as it is, Enter alone keeping one (`customURLsAsk`). | [`local_address.go`](../../internal/provider/local_address.go) |
 | Protocol detection | Works out which of Chat, Responses, Anthropic Messages and Gemini generateContent a base URL speaks when a provider is added. Each is asked at the URL as it takes it (`DetectBase`); Gemini's at the `…/v1beta` beside a typed `…/v1` or bare host, a Gemini model from the list picked for it, with the key in `x-goog-api-key` (#1346). Detection, endpoint tests and model tests share `probe`, which adds `anthropic-version` only for Anthropic Messages; OpenAI probes omit that default so a relay that refuses it can answer. User-supplied headers still apply through `Sign`. The editor asks with the form as it stands, before any Save (#1545): the URL, key and models typed (`picked`, else the saved picks, else the vendor list); a key not typed again is the saved provider's, or for an unsaved copy the copied one's (`copyOf`). The probe writes nothing and adds no provider, and the route stays behind `magpie web`'s key. | [`detect.go`](../../internal/provider/detect.go), [`test.go`](../../internal/provider/test.go) |
 
+## 原生搜索检测
+
+自定义供应商编辑器的“自己能联网搜索”旁有“检测”按钮。
+`POST /api/provider/test-search` 使用当前表单的地址、模型选择、
+请求头、额外请求体、代理和鉴权方式；未重填密钥时沿用已保存供应商
+或复制来源的密钥。新建预设使用其默认端点；明确清空的端点不会回退。
+供应商和每个密钥的代理使用当前草稿，自定义代理缺少地址时不发送请求。
+
+[`Provider.TestSearch`](../../internal/provider/test_search.go) 直接请求
+已配置的 Anthropic Messages 和 Responses 原生搜索工具，每种协议选择
+一个模型和可用密钥，不经过网关的代搜。JSON 和 SSE 响应均检查工具结果：
+Responses 需要已完成的 `web_search_call` 搜索动作；Anthropic 需要匹配的
+服务端搜索调用及含 URL 的搜索结果。普通回答、函数调用或仅宣布调用不会
+判为支持。SSE 还需 Responses 的 `response.completed` 或 Anthropic 的
+`message_stop`；响应限制为 2 MiB，提前结束、失败状态和内嵌错误均不确认。
+没有已选或缓存模型时，临时列表使用该协议所选密钥及其代理，不使用其他
+协议的密钥或端点。HTTP 和流内错误单独显示。结果只代表本次模型、密钥和协议，
+未确认不等于供应商完全不支持。
+
+检测会消耗供应商额度；不会勾选开关、保存配置或记录自动鉴权选择。
+接口沿用 `magpie web` 的访问密钥保护。
+
+## 原生压缩检测
+
+有 Responses 地址的 API 密钥供应商，在“Codex 在此服务商上原生压缩”
+旁提供“检测”。`POST /api/provider/test-compaction` 与搜索检测使用相同的
+草稿表单、密钥和访问保护，不保存配置，也不自动开启原生压缩。
+订阅账号继续使用原有开关，本检测不探测其账号。
+
+[`Provider.TestCompaction`](../../internal/provider/test_compaction.go) 发送
+带 `compaction_trigger` 的短对话到 `/responses`，测试此开关实际使用的
+请求路径。只有 `compaction` 或 `compaction_summary` 含非空
+`encrypted_content` 才确认原生压缩；普通摘要、reasoning、空压缩项和
+magpie 自己的 `magpie1:` 摘要不算。SSE 必须正常完成，HTTP 错误、
+流内错误或提前结束会显示失败。未返回有效内容显示“未确认”，不能据此
+断言整个供应商不支持；结果只代表本次模型和密钥，检测会消耗额度。
+
 ## Remote magpie
 
 The `remote-magpie` preset is of its own kind, `KindRemote` (`remote`), not

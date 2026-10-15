@@ -2980,6 +2980,12 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 .detect-out .detect-say.warn { color: var(--amber); }
 .detect-out .detect-say.err { color: var(--red); }
 .detect-row .detect-each { flex: none; }
+.native-test .detect-row { flex-wrap: wrap; }
+.native-test-out[hidden] { display: none; }
+.native-test-out .hint { overflow-wrap: anywhere; }
+.native-test-out .ok { color: var(--green); }
+.native-test-out .warn { color: var(--amber); }
+.native-test-out .err { color: var(--red); }
 .add-models .detect-row input { flex: 1; min-width: 0; }
 .add-models-list { max-height: 260px; overflow-y: auto; }
 .add-models-list .hint.err { color: var(--red); }
