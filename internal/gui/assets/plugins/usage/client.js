@@ -100,6 +100,7 @@ magpie.plugin("usage", (ctx) => {
     <p class="usage-note" id="ledNote"></p>
   </div>
   <div class="usage-pane ctx-pane" id="contextPane" hidden></div>
+  <div class="usage-pane" id="sub2apiPane" hidden></div>
   <div class="usage-pane sess-pane" id="sessionsPane" hidden>
     <div class="sess-tools">
       <div class="segs" id="sessAgent"></div>

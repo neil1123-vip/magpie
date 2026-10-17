@@ -4,6 +4,7 @@ package main
 
 import (
 	"github.com/yetone/magpie/internal/cli"
+	"github.com/yetone/magpie/internal/sub2apibrowser"
 	// the built-in plugins, registered with the runtime (internal/pluginrt)
 	_ "github.com/yetone/magpie/plugins/all"
 )
@@ -12,4 +13,9 @@ import (
 // Dockerfile, magpie-releases), so it stays in package main.
 var version = "dev"
 
-func main() { cli.Main(version) }
+func main() {
+	if sub2apibrowser.MaybeRun() {
+		return
+	}
+	cli.Main(version)
+}

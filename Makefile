@@ -32,19 +32,33 @@ ifeq ($(shell go env GOOS),android)
   TAGS = nogui
 endif
 
-.PHONY: build cli install test test-ui app icons release release-cli release-windows release-linux clean dev dev-once
+# The isolated Windows login host requires the private, pinned Wails module.
+# Prepare on the build host before any GOOS/GOARCH cross-compilation.
+WAILS_MODFILE = .tmp-sub2api-wails/go.mod
+DEV_TAGS = dev
+ifeq ($(shell go env GOOS),windows)
+  TAGS += sub2api_webview2
+  DEV_TAGS += sub2api_webview2
+  WAILS_FLAGS = -modfile "$(WAILS_MODFILE)"
+  WAILS_PREPARE = sub2api-webview2
+endif
 
-build:
-	go build -tags "$(TAGS)" -trimpath -ldflags="$(LDFLAGS)" -o magpie .
+.PHONY: build cli install test test-ui app icons release release-cli release-windows release-linux clean dev dev-once sub2api-webview2
+
+build: $(WAILS_PREPARE)
+	go build $(WAILS_FLAGS) -tags "$(TAGS)" -trimpath -ldflags="$(LDFLAGS)" -o magpie .
+
+sub2api-webview2:
+	go run ./build/sub2api-webview2
 
 cli:
 	CGO_ENABLED=0 go build -tags nogui -trimpath -ldflags="$(LDFLAGS)" -o magpie .
 
-install:
-	go install -tags "$(TAGS)" -trimpath -ldflags="$(LDFLAGS)" .
+install: $(WAILS_PREPARE)
+	go install $(WAILS_FLAGS) -tags "$(TAGS)" -trimpath -ldflags="$(LDFLAGS)" .
 
-test:
-	go vet -tags "$(TAGS)" ./... && go test -tags "$(TAGS)" ./...
+test: $(WAILS_PREPARE)
+	go vet $(WAILS_FLAGS) -tags "$(TAGS)" ./... && go test $(WAILS_FLAGS) -tags "$(TAGS)" ./...
 
 # The browser regressions under internal/gui/tests: the real pages in
 # Playwright's Chromium and WebKit; see internal/gui/tests/README.md.
@@ -103,13 +117,13 @@ release-cli:
 # arches cross-compile. Linked as a GUI program (no console window), with
 # the icon, version and a DPI-aware manifest from build/windows.
 WINVER = $(shell echo $(VERSION) | sed -E 's/^v//; s/[^0-9.].*//')
-release-windows:
+release-windows: sub2api-webview2
 	@mkdir -p dist
 	@go run github.com/tc-hib/go-winres@v0.3.3 make --in build/windows/winres.json --arch amd64,arm64 --out rsrc \
 		--file-version "$(or $(WINVER),0.0.0)" --product-version "$(or $(WINVER),0.0.0)"
 	@for arch in amd64 arm64; do \
 		echo "  windows/$$arch (app)"; \
-		CGO_ENABLED=0 GOOS=windows GOARCH=$$arch go build -tags production -trimpath -ldflags="$(LDFLAGS) -H windowsgui" -o dist/magpie-windows-$$arch.exe . || exit 1; \
+		CGO_ENABLED=0 GOOS=windows GOARCH=$$arch go build -modfile "$(WAILS_MODFILE)" -tags production,sub2api_webview2 -trimpath -ldflags="$(LDFLAGS) -H windowsgui" -o dist/magpie-windows-$$arch.exe . || exit 1; \
 	done; rm -f rsrc_windows_*.syso
 
 # The desktop app for Linux links GTK 3 and WebKitGTK 4.1 through cgo, so it
@@ -136,6 +150,6 @@ dev:
 	  MAGPIE_ADDR=$(DEV_ADDR) MAGPIE_DEV_UI=$(DEV_UI) MAGPIE_DEV_BACKEND=$(DEV_BACKEND) MAGPIE_DEV_CONTROL=$(DEV_CONTROL) build/dev.sh; \
 	else $(MAKE) --no-print-directory dev-once; fi
 
-dev-once:
-	@go build -tags dev -o magpie-dev . && echo "  magpie-dev · UI from internal/gui/assets, reload on save · gateway $(DEV_ADDR)"
+dev-once: $(WAILS_PREPARE)
+	@go build $(WAILS_FLAGS) -tags "$(DEV_TAGS)" -o magpie-dev . && echo "  magpie-dev · UI from internal/gui/assets, reload on save · gateway $(DEV_ADDR)"
 	@MAGPIE_ADDR=$(DEV_ADDR) MAGPIE_DEV_UI=$(DEV_UI) ./magpie-dev app

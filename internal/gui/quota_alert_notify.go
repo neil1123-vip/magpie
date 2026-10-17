@@ -17,6 +17,7 @@ import (
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/sub2api"
 )
 
 // notifier is the system's notifications, started the first time an alert
@@ -171,6 +172,22 @@ func (h *host) watchAlerts() {
 			title, body := turnDoneText(trayLang(settings.Load().Lang, systemLang), agentName(t.Agent), t)
 			n.sendAs(turnNotice, title, body)
 		}
+		provider.SetSub2APINotifier(func(c sub2api.Change) {
+			id := "magpie-sub2api-" + c.ID
+			queue, send, err := prepareSub2APIToast(n, id, sub2apiChangeText(trayLang(settings.Load().Lang, systemLang), c))
+			if err != nil {
+				c.ReportNotification(err)
+				return
+			}
+			queue(func() error {
+				if c.WithCurrent == nil {
+					return nil
+				}
+				err := c.WithCurrent(send)
+				c.ReportNotification(err)
+				return err
+			})
+		})
 		provider.WatchQuotas(context.Background(), wake, func(a provider.QuotaAlert) {
 			s := settings.Load()
 			title, body := alertText(trayLang(s.Lang, systemLang), a, s.BalanceAlert, s.QuotaLeft, time.Now())

@@ -111,6 +111,8 @@ type SubscriptionQuota struct {
 	User      string        `json:"user,omitempty"` // the account, so two of one vendor tell apart
 	Windows   []QuotaWindow `json:"windows"`
 	Balance   string        `json:"balance,omitempty"` // what is left on an API key, instead of windows
+	// Sub2API is the panel account reference, independent of inference keys.
+	Sub2API string `json:"sub2api,omitempty"`
 	// BalanceParts are the Balance's amounts each apart, when the balance
 	// field the user wrote has several or a percent (cardParts)
 	BalanceParts []BalancePart `json:"balanceParts,omitempty"`
@@ -198,6 +200,9 @@ type SubscriptionQuota struct {
 	// In-process read order, separate from the vendor's ReadAt and never
 	// persisted: restarting starts a new sequence.
 	readSeq uint64
+	// A panel balance's in-process authority, checked before accepting or
+	// reusing it. The durable last reading remains historical data only.
+	sub2apiBalance *sub2apiBalanceStamp
 	// glmPlan marks a key's quota read from the GLM Coding Plan endpoint,
 	// including custom providers. Only these can share ZCode's allowance.
 	glmPlan bool

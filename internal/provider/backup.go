@@ -44,6 +44,7 @@ func Restore(ps []Provider) (added, replaced int, err error) {
 			}
 		}
 		if i < 0 {
+			p.Sub2API = importedSub2APIBinding(p)
 			f.Providers = append(f.Providers, p)
 			added++
 			continue
@@ -109,6 +110,8 @@ func Mirror(ps []Provider, gs []Group) error {
 		}
 		if h, ok := here[p.ID]; ok {
 			p = KeepSecrets(p, h, p.Key == "" && len(p.Keys) == 0)
+		} else {
+			p.Sub2API = importedSub2APIBinding(p)
 		}
 		out = append(out, p)
 	}

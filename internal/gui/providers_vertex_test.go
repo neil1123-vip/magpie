@@ -50,17 +50,22 @@ func TestVertexProviderEditor(t *testing.T) {
 
 	mux := http.NewServeMux()
 	providerRoutes(mux, nil)
-	post := func(action, body string) *httptest.ResponseRecorder {
+	post := func(action string, form any) *httptest.ResponseRecorder {
 		t.Helper()
+		body, err := json.Marshal(form)
+		if err != nil {
+			t.Fatal(err)
+		}
 		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/"+action, strings.NewReader(body)))
+		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/"+action, strings.NewReader(string(body))))
 		return w
 	}
 	type row struct {
-		ID     string           `json:"id"`
-		Vertex *provider.Vertex `json:"vertex"`
-		Ready  bool             `json:"ready"`
-		Key    struct {
+		ID           string           `json:"id"`
+		SaveRevision string           `json:"saveRevision"`
+		Vertex       *provider.Vertex `json:"vertex"`
+		Ready        bool             `json:"ready"`
+		Key          struct {
 			Set bool `json:"set"`
 		} `json:"key"`
 	}
@@ -93,7 +98,7 @@ func TestVertexProviderEditor(t *testing.T) {
 		t.Fatalf("the presets that say they are Vertex AI's: %v", presets)
 	}
 
-	if w := post("save", `{"preset":"google-vertex","new":true,"vertex":{"project":" My-Project ","location":"US-Central1","credentials":" ~/keys/sa.json ","impersonate":"Bot@My-Project.iam.gserviceaccount.com"}}`); w.Code != 200 {
+	if w := post("save", json.RawMessage(`{"preset":"google-vertex","new":true,"vertex":{"project":" My-Project ","location":"US-Central1","credentials":" ~/keys/sa.json ","impersonate":"Bot@My-Project.iam.gserviceaccount.com"}}`)); w.Code != 200 {
 		t.Fatalf("add: %d %s", w.Code, w.Body)
 	}
 	want := provider.Vertex{Project: "my-project", Location: "us-central1", Credentials: "~/keys/sa.json", Impersonate: "bot@my-project.iam.gserviceaccount.com"}
@@ -104,13 +109,21 @@ func TestVertexProviderEditor(t *testing.T) {
 	}
 
 	// an edit that sends none keeps them; one that does changes them
-	if w := post("save", `{"id":"google-vertex","preset":"google-vertex","name":"Google Vertex AI","headers":{"X-Vertex-AI-LLM-Request-Type":"shared"}}`); w.Code != 200 {
+	if w := post("save", map[string]any{
+		"id": provider.VertexPreset, "preset": provider.VertexPreset, "name": "Google Vertex AI",
+		"saveRevision": rows[provider.VertexPreset].SaveRevision,
+		"headers":      map[string]string{"X-Vertex-AI-LLM-Request-Type": "shared"},
+	}); w.Code != 200 {
 		t.Fatalf("edit: %d %s", w.Code, w.Body)
 	}
 	if rows, _ = state(); rows[provider.VertexPreset].Vertex == nil || *rows[provider.VertexPreset].Vertex != want {
 		t.Fatalf("an edit without them lost them: %+v", rows[provider.VertexPreset].Vertex)
 	}
-	if w := post("save", `{"id":"google-vertex","preset":"google-vertex","name":"Google Vertex AI","vertex":{"project":"my-project","location":"","credentials":"","impersonate":""}}`); w.Code != 200 {
+	if w := post("save", map[string]any{
+		"id": provider.VertexPreset, "preset": provider.VertexPreset, "name": "Google Vertex AI",
+		"saveRevision": rows[provider.VertexPreset].SaveRevision,
+		"vertex":       map[string]string{"project": "my-project", "location": "", "credentials": "", "impersonate": ""},
+	}); w.Code != 200 {
 		t.Fatalf("edit: %d %s", w.Code, w.Body)
 	}
 	if rows, _ = state(); rows[provider.VertexPreset].Vertex == nil || *rows[provider.VertexPreset].Vertex != (provider.Vertex{Project: "my-project", Location: "global"}) {
@@ -123,7 +136,7 @@ func TestVertexProviderEditor(t *testing.T) {
 		t.Fatal(err)
 	}
 	vertex, _ := json.Marshal(provider.Vertex{Project: " Typed-Project ", Location: "", Credentials: creds})
-	w := post("test", `{"id":"google-vertex","typed":true,"vertex":`+string(vertex)+`}`)
+	w := post("test", json.RawMessage(`{"id":"google-vertex","typed":true,"vertex":`+string(vertex)+`}`))
 	var res struct {
 		Results []provider.Result `json:"results"`
 	}

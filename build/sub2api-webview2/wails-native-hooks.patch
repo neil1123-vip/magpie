@@ -1,0 +1,366 @@
+diff --git a/pkg/application/application.go b/pkg/application/application.go
+index 70b156f8..02e4f32c 100644
+--- a/pkg/application/application.go
++++ b/pkg/application/application.go
+@@ -858,6 +858,12 @@ func (a *App) handleWindowMessage(event *windowMessage) {
+ 		return
+ 	}
+ 	// Check if the message starts with "wails:"
++	if a.options.RawMessageOnly {
++		if a.options.RawMessageHandler != nil {
++			a.options.RawMessageHandler(window, event.message, event.originInfo)
++		}
++		return
++	}
+ 	if strings.HasPrefix(event.message, "wails:") {
+ 		a.debug("handleWindowMessage: Processing wails message", "message", event.message)
+ 		window.HandleMessage(event.message)
+diff --git a/pkg/application/application_options.go b/pkg/application/application_options.go
+index e1cd5810..5c6cad02 100644
+--- a/pkg/application/application_options.go
++++ b/pkg/application/application_options.go
+@@ -97,6 +97,9 @@ type Options struct {
+ 	// This is useful for implementing custom frontend-to-backend communication.
+ 	RawMessageHandler func(window Window, message string, originInfo *OriginInfo)
+ 
++	// RawMessageOnly prevents external pages from reaching Wails runtime messages.
++	RawMessageOnly bool
++
+ 	// WarningHandler is called when a warning occurs
+ 	WarningHandler func(string)
+ 
+diff --git a/pkg/application/webview_window_options.go b/pkg/application/webview_window_options.go
+index 4f7c75f0..cfb2da7e 100644
+--- a/pkg/application/webview_window_options.go
++++ b/pkg/application/webview_window_options.go
+@@ -354,6 +354,8 @@ const (
+ )
+ 
+ type WindowsWindow struct {
++	// NativeHooks installs restricted-host controls before the initial navigation.
++	NativeHooks *WebView2NativeHooks
+ 	// Select the type of translucent backdrop. Requires Windows 11 22621 or later.
+ 	// Only used when window's `BackgroundType` is set to `BackgroundTypeTranslucent`.
+ 	// Default: Auto
+@@ -436,6 +438,17 @@ type WindowsWindow struct {
+ 	PasswordAutosaveEnabled bool
+ }
+ 
++// WebView2NativeHooks installs controls for an isolated external login host.
++type WebView2NativeHooks struct {
++	CancelNavigation func(uri string) bool
++	PopupDenied      func(uri string)
++	BlockRequest     func(uri string, sourceKind uint32, resourceContext uint32) bool
++	PermissionDenied func(kind int)
++	Ready            func(err error)
++	DocumentScript   string
++	UserAgent        string
++}
++
+ type Theme int
+ 
+ const (
+diff --git a/pkg/application/webview_window_windows.go b/pkg/application/webview_window_windows.go
+index e3d8a023..90d319cf 100644
+--- a/pkg/application/webview_window_windows.go
++++ b/pkg/application/webview_window_windows.go
+@@ -2346,6 +2346,9 @@ func (w *windowsWebviewWindow) processRequest(
+ 	req *edge.ICoreWebView2WebResourceRequest,
+ 	args *edge.ICoreWebView2WebResourceRequestedEventArgs,
+ ) {
++	if w.parent.options.Windows.NativeHooks != nil {
++		return
++	}
+ 
+ 	// Setting the UserAgent on the CoreWebView2Settings clears the whole default UserAgent of the Edge browser, but
+ 	// we want to just append our ApplicationIdentifier. So we adjust the UserAgent for every request.
+@@ -2644,9 +2647,29 @@ func (w *windowsWebviewWindow) setupChromium() {
+ 	if !hasPermissionPolicy {
+ 		chromium.SetGlobalPermission(edge.CoreWebView2PermissionStateAllow)
+ 	}
+-	chromium.AddWebResourceRequestedFilter("*", edge.COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)
+-
+-	w.startRequestCancellation(w.navigateInitialPage)
++	if hooks := opts.NativeHooks; hooks != nil {
++		err := chromium.InstallNativeHooks(edge.NativeHooks{
++			CancelNavigation: hooks.CancelNavigation,
++			PopupDenied:      hooks.PopupDenied,
++			BlockRequest:     hooks.BlockRequest,
++			PermissionDenied: hooks.PermissionDenied,
++			UserAgent:        hooks.UserAgent,
++		})
++		if hooks.Ready != nil {
++			hooks.Ready(err)
++		}
++		if err != nil {
++			return
++		}
++		if hooks.DocumentScript != "" {
++			chromium.Init(hooks.DocumentScript)
++		}
++		// The restricted host has no Wails asset requests to cancel using CDP.
++		w.navigateInitialPage()
++	} else {
++		chromium.AddWebResourceRequestedFilter("*", edge.COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)
++		w.startRequestCancellation(w.navigateInitialPage)
++	}
+ }
+ 
+ func (w *windowsWebviewWindow) navigateInitialPage() {
+diff --git a/internal/webview2/pkg/edge/chromium.go b/internal/webview2/pkg/edge/chromium.go
+index 75e11f86..5e69419e 100644
+--- a/internal/webview2/pkg/edge/chromium.go
++++ b/internal/webview2/pkg/edge/chromium.go
+@@ -47,8 +47,10 @@ func globalErrorHandler(err error) {
+ }
+ 
+ type Chromium struct {
+-	hwnd    uintptr
+-	padding struct {
++	nativeHooks    *NativeHooks
++	popupRequested *nativePopupHandler
++	hwnd           uintptr
++	padding        struct {
+ 		Left   int32
+ 		Top    int32
+ 		Right  int32
+@@ -718,6 +720,9 @@ func (e *Chromium) PermissionRequested(_ *ICoreWebView2, args *iCoreWebView2Perm
+ 	if err != nil {
+ 		e.errorCallback(err)
+ 	}
++	if e.nativeHooks != nil && e.nativeHooks.PermissionDenied != nil {
++		e.nativeHooks.PermissionDenied(int(kind))
++	}
+ 	return 0
+ }
+ 
+@@ -735,6 +740,25 @@ func (e *Chromium) WebResourceRequested(sender *ICoreWebView2, args *ICoreWebVie
+ 	}
+ 	defer req.Release()
+ 
++	if e.nativeHooks != nil {
++		uri, uriErr := req.GetUri()
++		source, sourceErr := args.requestSourceKind()
++		resourceContext, contextErr := args.resourceContext()
++		if uriErr != nil || sourceErr != nil || contextErr != nil ||
++			(e.nativeHooks.BlockRequest != nil && e.nativeHooks.BlockRequest(uri, source, resourceContext)) {
++			response, err := e.environment.CreateWebResourceResponse(nil, 403, "Blocked by native host", "Content-Type: text/plain\r\n")
++			if err != nil {
++				e.errorCallback(err)
++				return 0
++			}
++			defer response.Release()
++			if err := args.PutResponse(response); err != nil {
++				e.errorCallback(err)
++			}
++			return 0
++		}
++	}
++
+ 	if e.WebResourceRequestedCallback != nil {
+ 		e.WebResourceRequestedCallback(req, args)
+ 	}
+@@ -805,7 +829,16 @@ func boolToInt(input bool) int {
+ 	return 0
+ }
+ 
+-func (e *Chromium) NavigationStarting(sender *ICoreWebView2, _ *IUnknown) uintptr {
++func (e *Chromium) NavigationStarting(sender *ICoreWebView2, args *IUnknown) uintptr {
++	if e.nativeHooks != nil {
++		navigation := (*nativeNavigationArgs)(unsafe.Pointer(args))
++		uri, err := navigation.uri()
++		if err != nil || (e.nativeHooks.CancelNavigation != nil && e.nativeHooks.CancelNavigation(uri)) {
++			if err := navigation.cancel(); err != nil {
++				e.errorCallback(err)
++			}
++		}
++	}
+ 	if e.NavigationStartingCallback != nil {
+ 		e.NavigationStartingCallback(sender)
+ 	}
+diff --git a/internal/webview2/pkg/edge/native_hooks.go b/internal/webview2/pkg/edge/native_hooks.go
+new file mode 100644
+--- /dev/null
++++ b/internal/webview2/pkg/edge/native_hooks.go
+@@ -0,0 +1,181 @@
++//go:build windows
++
++package edge
++
++import (
++	"fmt"
++	"unsafe"
++
++	"golang.org/x/sys/windows"
++)
++
++// NativeHooks belongs to an isolated host, and denies every popup and permission.
++type NativeHooks struct {
++	CancelNavigation func(string) bool
++	PopupDenied      func(string)
++	BlockRequest     func(string, uint32, uint32) bool
++	PermissionDenied func(int)
++	UserAgent        string
++}
++
++// InstallNativeHooks must complete before any external page is navigated.
++func (e *Chromium) InstallNativeHooks(hooks NativeHooks) error {
++	if hooks.UserAgent != "" {
++		settings, err := e.GetSettings()
++		if err != nil {
++			return fmt.Errorf("WebView2 settings: %w", err)
++		}
++		if settings == nil {
++			return fmt.Errorf("WebView2 settings unavailable")
++		}
++		settings2 := settings.GetICoreWebView2Settings2()
++		settings.Release()
++		if settings2 == nil {
++			return fmt.Errorf("ICoreWebView2Settings2 is required")
++		}
++		err = settings2.PutUserAgent(hooks.UserAgent)
++		settings2.Vtbl.Release.Call(uintptr(unsafe.Pointer(settings2)))
++		if err != nil {
++			return fmt.Errorf("WebView2 user agent: %w", err)
++		}
++	}
++	iid, _ := windows.GUIDFromString("{DB75DFC7-A857-4632-A398-6969DDE26C0A}")
++	var extended *nativeCore22
++	hr, _, _ := e.webview.vtbl.QueryInterface.Call(
++		uintptr(unsafe.Pointer(e.webview)), uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&extended)),
++	)
++	if hr != 0 || extended == nil {
++		return fmt.Errorf("ICoreWebView2_22 is required: HRESULT %#x", hr)
++	}
++	defer extended.vtbl.Release.Call(uintptr(unsafe.Pointer(extended)))
++	pattern, _ := windows.UTF16PtrFromString("*")
++	hr, _, _ = extended.vtbl.AddFilter.Call(uintptr(unsafe.Pointer(extended)),
++		uintptr(unsafe.Pointer(pattern)), 0, 0xffffffff)
++	if hr != 0 {
++		return fmt.Errorf("Worker-aware request filter: HRESULT %#x", hr)
++	}
++	e.nativeHooks = &hooks
++	e.SetGlobalPermission(CoreWebView2PermissionStateDeny)
++	e.popupRequested = &nativePopupHandler{vtbl: &nativePopupHandlerTable, chromium: e}
++	var token _EventRegistrationToken
++	hr, _, _ = e.webview.vtbl.AddNewWindowRequested.Call(
++		uintptr(unsafe.Pointer(e.webview)), uintptr(unsafe.Pointer(e.popupRequested)), uintptr(unsafe.Pointer(&token)),
++	)
++	if hr != 0 {
++		return fmt.Errorf("NewWindowRequested: HRESULT %#x", hr)
++	}
++	return nil
++}
++
++// COM extension interfaces retain every base slot. Versions 2..21 add 62 slots.
++type nativeCore22Table struct {
++	iCoreWebView2Vtbl
++	Versions2Through21 [62]ComProc
++	AddFilter          ComProc
++	RemoveFilter       ComProc
++}
++
++type nativeCore22 struct{ vtbl *nativeCore22Table }
++
++type nativeNavigationTable struct {
++	_IUnknownVtbl
++	GetURI, IsUserInitiated, IsRedirected, RequestHeaders, GetCancel, PutCancel, NavigationID ComProc
++}
++
++type nativeNavigationArgs struct{ vtbl *nativeNavigationTable }
++
++func nativeURI(this unsafe.Pointer, getter ComProc) (string, error) {
++	var value *uint16
++	hr, _, _ := getter.Call(uintptr(this), uintptr(unsafe.Pointer(&value)))
++	if hr != 0 {
++		return "", windows.Errno(hr)
++	}
++	if value == nil {
++		return "", fmt.Errorf("native URI has no value")
++	}
++	defer CoTaskMemFree(unsafe.Pointer(value))
++	return windows.UTF16PtrToString(value), nil
++}
++
++func (i *nativeNavigationArgs) uri() (string, error) {
++	return nativeURI(unsafe.Pointer(i), i.vtbl.GetURI)
++}
++
++func (i *nativeNavigationArgs) cancel() error {
++	hr, _, _ := i.vtbl.PutCancel.Call(uintptr(unsafe.Pointer(i)), 1)
++	if hr != 0 {
++		return windows.Errno(hr)
++	}
++	return nil
++}
++
++type nativePopupTable struct {
++	_IUnknownVtbl
++	GetURI, PutNewWindow, GetNewWindow, PutHandled ComProc
++}
++
++type nativePopupArgs struct{ vtbl *nativePopupTable }
++type nativePopupHandler struct {
++	vtbl     *nativePopupHandlerVtbl
++	chromium *Chromium
++}
++type nativePopupHandlerVtbl struct {
++	_IUnknownVtbl
++	Invoke ComProc
++}
++
++var nativePopupHandlerTable = nativePopupHandlerVtbl{
++	_IUnknownVtbl{
++		NewComProc(func(this *nativePopupHandler, refiid, object uintptr) uintptr {
++			return this.chromium.QueryInterface(refiid, object)
++		}),
++		NewComProc(func(this *nativePopupHandler) uintptr { return this.chromium.AddRef() }),
++		NewComProc(func(this *nativePopupHandler) uintptr { return this.chromium.Release() }),
++	},
++	NewComProc(func(this *nativePopupHandler, _ *ICoreWebView2, args *nativePopupArgs) uintptr {
++		// Handled is set even if the URI cannot be read.
++		hr, _, _ := args.vtbl.PutHandled.Call(uintptr(unsafe.Pointer(args)), 1)
++		if hr != 0 {
++			this.chromium.errorCallback(windows.Errno(hr))
++			return hr
++		}
++		uri, _ := nativeURI(unsafe.Pointer(args), args.vtbl.GetURI)
++		if hook := this.chromium.nativeHooks.PopupDenied; hook != nil {
++			hook(uri)
++		}
++		return 0
++	}),
++}
++
++type nativeResourceArgs2Table struct {
++	_ICoreWebView2WebResourceRequestedEventArgsVtbl
++	GetSourceKind ComProc
++}
++type nativeResourceArgs2 struct{ vtbl *nativeResourceArgs2Table }
++
++func (i *ICoreWebView2WebResourceRequestedEventArgs) requestSourceKind() (uint32, error) {
++	iid, _ := windows.GUIDFromString("{9C562C24-B219-4D7F-92F6-B187FBBADD56}")
++	var extended *nativeResourceArgs2
++	hr, _, _ := i.vtbl.QueryInterface.Call(
++		uintptr(unsafe.Pointer(i)), uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&extended)),
++	)
++	if hr != 0 || extended == nil {
++		return 0, fmt.Errorf("request source kind unavailable: HRESULT %#x", hr)
++	}
++	defer extended.vtbl.Release.Call(uintptr(unsafe.Pointer(extended)))
++	var source uint32
++	hr, _, _ = extended.vtbl.GetSourceKind.Call(uintptr(unsafe.Pointer(extended)), uintptr(unsafe.Pointer(&source)))
++	if hr != 0 {
++		return 0, windows.Errno(hr)
++	}
++	return source, nil
++}
++
++func (i *ICoreWebView2WebResourceRequestedEventArgs) resourceContext() (uint32, error) {
++	var context uint32
++	hr, _, _ := i.vtbl.GetResourceContext.Call(uintptr(unsafe.Pointer(i)), uintptr(unsafe.Pointer(&context)))
++	if hr != 0 {
++		return 0, windows.Errno(hr)
++	}
++	return context, nil
++}

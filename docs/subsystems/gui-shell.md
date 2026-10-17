@@ -7,6 +7,11 @@ with no binding generator and no bundler. `magpie web` serves the same page
 to a browser for a machine with no desktop. Package `internal/gui` hosts all
 three.
 
+The source editor's Sub2API sign-in and Usage's Sub2API groups tab use a
+desktop-gated API. Their account lifecycle, background monitor and isolated
+Windows browser host are described in
+[Sub2API accounts and group rates](sub2api.md).
+
 ## Responsibilities and sources of truth
 
 | Part | Responsibility | Source |
@@ -33,6 +38,21 @@ three.
 8. On the Mac, Settings › Show in Dock puts magpie in the Dock never (the default: out of the Dock, and so out of Command-Tab), while the window is open (`DockWindow`) or always (`Dock`); a full-screen window joins it whatever the setting (`inDock`, `dockOnFullscreen`). `openMain` joins before it shows the window (`setDock` runs on the main thread at once). An app activated out of the Dock (the quick panel's focus) that then joins it stays last in Command-Tab's order though it is in front, so joining to the front activates magpie by way of the Dock (`dockStep`, `activateAgain`; #1381, `TestDockStep`, `TestDockJoinLeadsCommandTab`). It does so without asking NSApp whether magpie is active: the Mac makes it the front app at once, and NSApp says so only once the main thread has taken that in, after the join on a busy Mac (#1651).
 
 ## Constraints and failure behavior
+
+### Provider-list ordering
+
+`api` in [`app.js`](../../internal/gui/assets/app.js) coordinates shared
+`providers` reads and source, key and account writes. Reads begun before a
+write finishes follow a current read, on success or failure. A late provider
+list cannot undo an acknowledged source edit or price application. Each new
+read makes its own request, so a newly opened page can finish while an older
+page's request is pending; `providers?wait=1` keeps its wait semantics.
+Writes run once; if overlapping writes or an accepted read after a write
+began make its returned list uncertain, only the list is read again. This
+also covers a read that observed another window's change, and a read that
+finished before the pending write committed. Calls with their own
+response-header callback or cancellation signal
+keep independent requests and cancellation.
 
 ### Allowance card refreshes
 

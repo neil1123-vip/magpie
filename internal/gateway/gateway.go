@@ -600,6 +600,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	go provider.KeepPluginsListed(ctx) // models a plugin's vendor drops or adds, while magpie runs
 	// and fetches the lists of the providers the user asked to keep fresh (#2135)
 	go provider.KeepListsFresh(ctx)
+	go provider.KeepSub2API(ctx)
 	// and keeps the community's plugins up to date, noting others' updates, and the Bun they run on
 	go plugin.KeepUpdated(ctx)
 	go plugin.KeepBunUpdated(ctx)

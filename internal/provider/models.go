@@ -2104,6 +2104,12 @@ func EffectivePrice(providerID, model string) (catalog.Price, bool) {
 // the list is one snapshot of the prices rather than a reading per row, and
 // a price changed while it is read takes effect in the next call.
 func EffectivePriceIn(s settings.Settings, providerID, model string) (catalog.Price, bool) {
+	return EffectiveKeyPriceIn(s, providerID, model, "")
+}
+
+// EffectiveKeyPriceIn uses the confirmed key's local rate when the call names
+// its actual fingerprint. Calls without one keep the source's rate.
+func EffectiveKeyPriceIn(s settings.Settings, providerID, model, keyID string) (catalog.Price, bool) {
 	// A price is keyed by the id the provider has now, so one written before
 	// a rename is read under the id it has. Only an id, or one the provider
 	// was renamed from, resolves; anything else is looked up as given, so a
@@ -2113,6 +2119,14 @@ func EffectivePriceIn(s settings.Settings, providerID, model string) (catalog.Pr
 	p, known := byIDOrWas(providerID)
 	if !known {
 		p = Provider{ID: providerID}
+	}
+	if keyID != "" {
+		for _, key := range Sub2APIKeyBindings(p) {
+			if key.ID == keyID && key.PriceRate > 0 && PriceRateOK(key.PriceRate) == "" {
+				p.PriceRate = key.PriceRate
+				break
+			}
+		}
 	}
 	return priceOf(s, p, known, model)
 }

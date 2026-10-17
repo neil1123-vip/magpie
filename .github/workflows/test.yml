@@ -48,6 +48,14 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = Linux ]; then echo "tags=gtk3" >> "$GITHUB_OUTPUT"; fi
+          if [ "$RUNNER_OS" = Windows ]; then echo "tags=sub2api_webview2" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Prepare Sub2API WebView2 (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          modfile=$(go run ./build/sub2api-webview2)
+          echo "GOFLAGS=-tags=sub2api_webview2 -modfile=$modfile" >> "$GITHUB_ENV"
 
       # Unformatted files reached main 8 times from 10-01 to 10-06 and each
       # took a gofmt commit of its own. Linux only: Windows checks out CRLF.

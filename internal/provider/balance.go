@@ -23,6 +23,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yetone/magpie/internal/sub2api"
 )
 
 // balanceSource is where one provider's balance is asked and how the
@@ -156,7 +158,7 @@ var tokenQueries = []struct{ account, key, field string }{
 // header of the user's own still asks it as they set it.
 func keyQueryOf(p Provider) Provider {
 	p = keyNotToken(p)
-	if p.BalanceURL == "" || strings.TrimSpace(p.BalanceToken) != "" {
+	if p.BalanceURL == "" || strings.TrimSpace(p.BalanceToken) != "" || p.Sub2API != nil {
 		return p
 	}
 	for k, v := range p.Headers {
@@ -1218,6 +1220,17 @@ func balanceRead(ctx context.Context, p Provider) (amount string, parts, split [
 	if !ok || p.Account != nil || p.Key == "" {
 		return "", nil, nil, nil, false, nil
 	}
+	if p.Sub2API != nil {
+		b, err := readSub2APIAccountBalance(ctx, p)
+		if err != nil {
+			return "", nil, nil, nil, true, err
+		}
+		parts, err := readBalanceParts(b, balancePathOf(p))
+		if err != nil {
+			return "", nil, nil, nil, true, err
+		}
+		return joinBalanceParts(parts), parts, nil, nil, true, nil
+	}
 	if src.token != "" && p.BalanceURL != "" {
 		switch balanceURLPath(p.BalanceURL) {
 		case newAPIKeyUsage:
@@ -1401,8 +1414,9 @@ func keyNotToken(p Provider) Provider {
 
 var keyBalanceCache struct {
 	sync.Mutex
-	at   time.Time
-	data []SubscriptionQuota
+	at    time.Time
+	data  []SubscriptionQuota
+	epoch uint64
 }
 
 // ForgetBalances has the next KeyBalances ask again, after a provider's
@@ -1410,6 +1424,7 @@ var keyBalanceCache struct {
 func ForgetBalances() {
 	keyBalanceCache.Lock()
 	keyBalanceCache.data = nil
+	keyBalanceCache.epoch++
 	keyBalanceCache.Unlock()
 	// nor is a key's allowance as last read, which may be another key's
 	forgetKeyAllowances()
@@ -1424,19 +1439,41 @@ func KeyBalances(ctx context.Context) []SubscriptionQuota {
 	c := &keyBalanceCache
 	_, again := refreshing(ctx) // one card read again (RefreshUsage)
 	c.Lock()
+	epoch := c.epoch
+	kept := slices.Clone(c.data)
+	var cached []SubscriptionQuota
 	// with allowances read only when asked, the cards stand as they were
 	// last read till the user asks (#1518)
 	if !again && c.data != nil && (time.Since(c.at) < time.Minute || heldRead(ctx)) {
-		defer c.Unlock()
-		return c.data
+		cached = kept
 	}
 	c.Unlock()
+	if cached != nil {
+		var current bool
+		err := withSub2APIBalances(cached, func(session *sub2api.Manager) error {
+			for _, q := range cached {
+				if q.Sub2API != "" {
+					if err := q.sub2apiBalance.check(session, q); err != nil {
+						return err
+					}
+				}
+			}
+			c.Lock()
+			current = c.epoch == epoch
+			c.Unlock()
+			return nil
+		})
+		if err == nil && current {
+			return cached
+		}
+	}
 	ctx, seq := quotaReading(ctx)
 	type job struct {
 		p    Provider
 		user string
 	}
 	var jobs []job
+	panelAccounts := map[string]bool{}
 	for _, p := range All() {
 		if p.Hidden || p.Off || p.Account != nil || p.Key == "" {
 			continue
@@ -1447,8 +1484,18 @@ func KeyBalances(ctx context.Context) []SubscriptionQuota {
 			continue
 		}
 		others := 0
-		if src.token != "" || zen {
+		if src.token != "" || p.Sub2API != nil || zen {
 			// the account's balance is the same whichever key asks
+			if p.Sub2API != nil {
+				if !wantsCard(ctx, p.ID, "") {
+					continue
+				}
+				id := sub2apiBalanceID(p)
+				if panelAccounts[id] {
+					continue
+				}
+				panelAccounts[id] = true
+			}
 			jobs = append(jobs, job{p, ""})
 			continue
 		}
@@ -1489,6 +1536,16 @@ func KeyBalances(ctx context.Context) []SubscriptionQuota {
 			defer wg.Done()
 			defer slots.take(ctx, j.p.ID)()
 			q := SubscriptionQuota{Provider: j.p.ID, Name: j.p.Name, Icon: j.p.Icon, User: j.user, Windows: []QuotaWindow{}}
+			if j.p.Sub2API != nil {
+				q.Sub2API = j.p.Sub2API.Session
+				var err error
+				q.sub2apiBalance, err = sub2apiBalanceStampOf(j.p)
+				if err != nil {
+					q.Error = err.Error()
+					out[i] = q
+					return
+				}
+			}
 			if clineKeyCard(j.p) {
 				// ClinePass's limits beside the credits (cline_usage.go)
 				if ws, amount, err := clineKeyUsage(ctx, j.p); err != nil {
@@ -1526,20 +1583,60 @@ func KeyBalances(ctx context.Context) []SubscriptionQuota {
 				noteKeyAllowance(j.p, ws, now)
 			}
 			// the vendor failing a while shows the balance last read
-			out[i] = keepReading(ctx, q, keyTag("balance", j.p.Key))
+			tag := keyTag("balance", j.p.Key)
+			if j.p.Sub2API != nil {
+				out[i] = q // panel authority is checked at the final local commit
+				return
+			}
+			out[i] = keepReading(ctx, q, tag)
 		}()
 	}
 	wg.Wait()
 	out = slices.DeleteFunc(out, func(q SubscriptionQuota) bool { return q.Provider == "" })
-	if ctx.Err() == nil {
-		// each balance kept, and drawn over time with its runs-out
-		noteBalanceHistory(out, time.Now())
+	err := withSub2APIBalances(slices.Concat(out, kept), func(session *sub2api.Manager) error {
 		c.Lock()
-		c.data = cacheCards(c.data, out, seq, again)
-		if !again {
-			c.at, out = time.Now(), c.data
+		defer c.Unlock()
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		c.Unlock()
+		for i, q := range out {
+			if q.Sub2API == "" {
+				continue
+			}
+			err := q.sub2apiBalance.check(session, q)
+			if c.epoch != epoch {
+				err = ErrSub2APIConflict
+			}
+			if err != nil {
+				q = failedSub2APIBalance(q, err)
+			}
+			q.readSeq = seq
+			out[i] = keepSub2APIBalance(q)
+		}
+		// Each panel result stays guarded until all local effects are accepted.
+		noteBalanceHistory(out, time.Now())
+		if c.epoch == epoch {
+			c.data = cacheCards(c.data, out, seq, again)
+			for i, q := range c.data {
+				if q.Sub2API != "" {
+					if err := q.sub2apiBalance.check(session, q); err != nil {
+						c.data[i] = keepSub2APIBalance(failedSub2APIBalance(q, err))
+					}
+				}
+			}
+			if !again {
+				c.at, out = time.Now(), c.data
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		for i, q := range out {
+			if q.Sub2API != "" {
+				q.readSeq = seq
+				out[i] = keepSub2APIBalance(failedSub2APIBalance(q, err))
+			}
+		}
 	}
 	return out
 }

@@ -105,6 +105,7 @@ func CachedCards(now time.Time) []SubscriptionQuota {
 		}
 	}
 	plans, balances = withKeyReadings(plans, ps, "plan"), withKeyReadings(balances, ps, "balance")
+	balances = checkedSub2APIBalances(balances)
 	plans, subs = seatCards(plans, subs)
 	subs = withAccountNames(subs)
 	out := []SubscriptionQuota{}

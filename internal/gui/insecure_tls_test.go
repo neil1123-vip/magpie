@@ -22,6 +22,7 @@ func TestProviderSaveInsecureTLS(t *testing.T) {
 	providerRoutes(mux, nil)
 	post := func(body string) (int, string) {
 		t.Helper()
+		body = currentProviderForm(t, body)
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(body)))
 		return w.Code, w.Body.String()

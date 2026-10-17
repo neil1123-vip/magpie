@@ -13,7 +13,7 @@ import (
 const swapKnown = 64
 
 // pricedAs is what a gateway call is priced as, the same for every call of
-// one provider, model, served model and effort.
+// one provider, model, served model, effort and key.
 type pricedAs struct {
 	provider string
 	flags    uint16
@@ -28,7 +28,7 @@ type blockPricer struct {
 	aliases map[string]string
 	wires   map[string]string
 	price   func(Record) *catalog.Price
-	by      map[[4]string]pricedAs
+	by      map[[5]string]pricedAs
 	agents  map[string][2]string
 	pooled  []*[]packedRow
 }
@@ -48,12 +48,12 @@ func (b *blockPricer) release() {
 }
 
 func newBlockPricer(aliases, wires map[string]string, price func(Record) *catalog.Price) *blockPricer {
-	return &blockPricer{aliases: aliases, wires: wires, price: price, by: map[[4]string]pricedAs{}, agents: map[string][2]string{}}
+	return &blockPricer{aliases: aliases, wires: wires, price: price, by: map[[5]string]pricedAs{}, agents: map[string][2]string{}}
 }
 
 // as is priceRow's answer for a gateway call of these names.
-func (b *blockPricer) as(prov, model, served, effort string) pricedAs {
-	k := [4]string{prov, model, served, effort}
+func (b *blockPricer) as(prov, model, served, effort, keyID string) pricedAs {
+	k := [5]string{prov, model, served, effort, keyID}
 	if a, ok := b.by[k]; ok {
 		return a
 	}
@@ -68,7 +68,7 @@ func (b *blockPricer) as(prov, model, served, effort string) pricedAs {
 	if GroupRouted(sent, served) {
 		a.flags |= 32
 	}
-	a.price = b.price(Record{Provider: prov, Model: model, Served: served, Effort: effort})
+	a.price = b.price(Record{Provider: prov, Model: model, Served: served, Effort: effort, ProviderKeyID: keyID})
 	b.by[k] = a
 	return a
 }
@@ -123,7 +123,7 @@ func (b *blockPricer) block(packed *rowChunk) *rowChunk {
 		flags uint16
 		price *catalog.Price
 	}
-	names := map[[4]uint32]ids{}
+	names := map[[5]uint32]ids{}
 	agents := map[uint32][2]uint32{}
 	shapes := map[uint32]ids{}
 	for i := range c.Rows {
@@ -131,10 +131,10 @@ func (b *blockPricer) block(packed *rowChunk) *rowChunk {
 		got, ok := shapes[p.Shape]
 		if !ok {
 			t := c.Shapes[p.Shape]
-			k := [4]uint32{t[1], t[5], t[7], t[8]}
+			k := [5]uint32{t[1], t[5], t[7], t[8], t[18]}
 			named, ok := names[k]
 			if !ok {
-				a := b.as(c.Strings[k[0]], c.Strings[k[1]], c.Strings[k[2]], c.Strings[k[3]])
+				a := b.as(c.Strings[k[0]], c.Strings[k[1]], c.Strings[k[2]], c.Strings[k[3]], c.Strings[k[4]])
 				named = ids{intern(a.provider, k[0]), a.flags, a.price}
 				names[k] = named
 			}

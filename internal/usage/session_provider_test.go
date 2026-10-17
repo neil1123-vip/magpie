@@ -59,8 +59,18 @@ func TestDesktopSessionAccountMetadata(t *testing.T) {
 	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
 	t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
 	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
-	root := sessions.DesktopDataDirs()[0]
-	root3p := sessions.DesktopDataDirs()[1]
+	roots := sessions.DesktopDataDirs()
+	root := roots[0]
+	root3p := ""
+	for _, dir := range roots {
+		if filepath.Base(dir) == "Claude-3p" {
+			root3p = dir
+			break
+		}
+	}
+	if root3p == "" {
+		t.Fatal("Claude Desktop's third-party data directory is missing")
+	}
 	account, org := "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
 	write := func(path, text string) {
 		t.Helper()

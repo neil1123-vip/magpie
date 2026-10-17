@@ -13,6 +13,10 @@ Plugin ownership of the deprecated built-in subscriptions is in
 [Provider and plugin ownership](provider-plugins.md). How the gateway orders
 keys and accounts per request is in [Gateway routing and fallback](gateway-routing.md).
 
+Sub2API panel credentials, existing balance bindings, background group-rate
+monitoring and manual price application are described in
+[Sub2API accounts and group rates](sub2api.md).
+
 ## Responsibilities and sources of truth
 
 | Part | Responsibility | Source |

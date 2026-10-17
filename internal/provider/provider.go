@@ -10,6 +10,8 @@ package provider
 import (
 	"bytes"
 	"cmp"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +28,7 @@ import (
 
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/filelock"
 	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/steady"
@@ -197,6 +200,8 @@ type Provider struct {
 	// a price the user set for one of its models stands as set. 0 is the
 	// price as listed; at most three decimals (PriceRateOK).
 	PriceRate float64 `json:"priceRate,omitempty"`
+	// KeyPriceRates overrides local estimates only for the actual key fingerprint.
+	KeyPriceRates map[string]float64 `json:"keyPriceRates,omitempty"`
 
 	// Headers are extra HTTP request headers sent to the vendor, exactly as
 	// the user typed them. They ride on every request magpie makes to a plain
@@ -335,6 +340,9 @@ type Provider struct {
 	// no body, for an endpoint that answers only a POST (#2368). Any other
 	// is refused when the balance is read (balanceMethodOf).
 	BalanceMethod string `json:"balanceMethod,omitempty"`
+	// Sub2API refers to a local panel session; no panel credentials ride
+	// in the portable provider configuration.
+	Sub2API *Sub2APIBinding `json:"sub2api,omitempty"`
 	// BalanceToken is what a vendor tells the whole account's balance to,
 	// where a key is told only what is left on itself: AiHubMix's system
 	// access token, or a new-api relay's for its /api/user/self named in
@@ -426,9 +434,12 @@ type Provider struct {
 	// Account is set when the provider is an agent the user signed in to
 	// (see account.go); it is derived, never stored.
 	Account *Account `json:"-"`
+	// SaveRevision identifies the stored fields the editor opened.
+	SaveRevision string `json:"-"`
 }
 
 type file struct {
+	baseline  configBaseline
 	Providers []Provider `json:"providers"`
 	Groups    []Group    `json:"groups,omitempty"`
 	// Searches are the web search APIs a model's search goes to when no
@@ -451,6 +462,12 @@ type file struct {
 	PluginLeft []LeftRecord `json:"pluginLeft,omitempty"`
 }
 
+type configBaseline struct {
+	path   string
+	exists bool
+	hash   [sha256.Size]byte
+}
+
 // Path is the file the user's providers live in.
 func Path() string { return filepath.Join(appdir.Config(), "providers.json") }
 
@@ -467,6 +484,9 @@ func load() file {
 // decoded: never an empty catalog, to list as none, back up or write over.
 var ErrUnreadable = errors.New("providers.json can't be read")
 
+// ErrConfigConflict refuses a stale whole-file write or an old editor.
+var ErrConfigConflict = errors.New("the provider configuration changed; reopen it before saving")
+
 type unreadableError struct {
 	path string
 	err  error
@@ -482,8 +502,10 @@ func (e *unreadableError) Unwrap() []error { return []error{ErrUnreadable, e.err
 // catalog to write over. Only a missing file is a first use.
 func read() (file, error) {
 	var f file
-	b, err := steady.ReadFile(Path())
+	path := Path()
+	b, err := steady.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
+		f.baseline = configBaseline{path: path}
 		return f, nil
 	}
 	if err != nil {
@@ -492,6 +514,7 @@ func read() (file, error) {
 	// An editor that saves with a byte-order mark leaves JSON that Go's
 	// decoder refuses; read as broken, the file fell back to its .bak, an
 	// older generation without what was saved since (#1821).
+	baseline := configBaseline{path: path, exists: true, hash: sha256.Sum256(b)}
 	b = bytes.TrimPrefix(b, utf8BOM)
 	if err := json.Unmarshal(b, &f); err != nil {
 		// one left all zero by a crash (#1505) is its last good generation
@@ -504,6 +527,7 @@ func read() (file, error) {
 			return file{}, &unreadableError{Path(), err}
 		}
 	}
+	f.baseline = baseline
 	return f, nil
 }
 
@@ -549,8 +573,24 @@ func Routings() ([]string, error) {
 // file cut short.
 func store(f file) error {
 	p := Path()
+	if f.baseline.path != p {
+		return ErrConfigConflict
+	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
+	}
+	unlock, held := filelock.Lock(p+".lock", filelock.Wait)
+	defer unlock()
+	if !held {
+		return errors.New("could not lock providers.json; the configuration was left unchanged")
+	}
+	current, err := steady.ReadFile(p)
+	exists := err == nil
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return &unreadableError{p, err}
+	}
+	if exists != f.baseline.exists || exists && sha256.Sum256(current) != f.baseline.hash {
+		return ErrConfigConflict
 	}
 	// a group as it was read has the models its patterns matched then
 	// among its members: they are found again each time, never written
@@ -599,6 +639,7 @@ func All() []Provider {
 
 // clone is p with its settings unshared: slices, maps and pointers copied.
 func (p Provider) clone() Provider {
+	p.Sub2API = cloneSub2APIBinding(p.Sub2API)
 	p.Was = slices.Clone(p.Was)
 	p.Keys = slices.Clone(p.Keys)
 	p.Fallback = slices.Clone(p.Fallback)
@@ -609,6 +650,7 @@ func (p Provider) clone() Provider {
 	p.Headers = maps.Clone(p.Headers)
 	p.ExtraBody = maps.Clone(p.ExtraBody)
 	p.AccountProxies = maps.Clone(p.AccountProxies)
+	p.KeyPriceRates = maps.Clone(p.KeyPriceRates)
 	p.AccountCaps = maps.Clone(p.AccountCaps)
 	p.AccountNames = maps.Clone(p.AccountNames)
 	if p.AccountWindowCaps != nil {
@@ -652,6 +694,7 @@ func allProviders() []Provider {
 	picks := map[string]Provider{}
 	var out []Provider
 	for _, p := range stored {
+		p.SaveRevision = saveRevision(p, true)
 		p = normalize(p)
 		if !hasEndpoint(p) {
 			picks[p.ID] = p
@@ -683,6 +726,10 @@ func allProviders() []Provider {
 // account queued 62s with the wait set to 1s).
 func withPicks(a, pk Provider) Provider {
 	a.PickedFrom, a.Delisted = pk.PickedFrom, pk.Delisted
+	a.SaveRevision = pk.SaveRevision
+	if a.SaveRevision == "" {
+		a.SaveRevision = saveRevision(Provider{}, false)
+	}
 	a.Models, a.Unlisted, a.Off, a.Fallback, a.Routing, a.Affinity, a.KeepLogin, a.KeepLoginAs, a.Contexts, a.Family = pk.Models, pk.Unlisted, pk.Off, pk.Fallback, pk.Routing, pk.Affinity, pk.KeepLogin, pk.KeepLoginAs, pk.Contexts, pk.Family
 	a.SwitchOnly = pk.SwitchOnly
 	a.Sink, a.NoModels = pk.Sink, pk.NoModels
@@ -768,6 +815,27 @@ func Slug(name string) string {
 
 // Save adds or replaces a provider.
 func Save(p Provider) error {
+	return save(p, "", false)
+}
+
+// SaveWithRevision also checks the complete source the editor opened.
+func SaveWithRevision(p Provider, expected string) error {
+	return save(p, expected, true)
+}
+
+func saveRevision(p Provider, exists bool) string {
+	if !exists {
+		return "absent:v1"
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		return ""
+	}
+	hash := sha256.Sum256(b)
+	return "v1:" + hex.EncodeToString(hash[:])
+}
+
+func save(p Provider, expected string, checkRevision bool) error {
 	// a key given a Vertex AI provider is refused here, before normalize
 	// drops it: it would never be sent
 	if p.IsVertex() && (strings.TrimSpace(p.Key) != "" || len(p.Keys) > 0) {
@@ -840,6 +908,8 @@ func Save(p Provider) error {
 			return fmt.Errorf("%s needs an API key", p.Name)
 		}
 	}
+	sub2apiEdits.Lock()
+	defer sub2apiEdits.Unlock()
 	f, err := read()
 	if err != nil {
 		return err
@@ -849,9 +919,25 @@ func Save(p Provider) error {
 	if i >= 0 {
 		was = &f.Providers[i]
 	}
+	if checkRevision && (was != nil || expected != "") {
+		current := Provider{}
+		if was != nil {
+			current = *was
+		}
+		if expected == "" || expected != saveRevision(current, was != nil) {
+			return ErrConfigConflict
+		}
+	}
 	p.PickedFrom = listedWith(p, was)
 	p.Delisted = delistedWith(p, was)
 	if was != nil {
+		// Session bindings change through their dedicated operation; an
+		// editor opened before login must not erase or restore one.
+		p.Sub2API = cloneSub2APIBinding(was.Sub2API)
+		p.KeyPriceRates = sub2apiKeyPriceRates(*was)
+		if err := keepSub2APIBinding(&p); err != nil {
+			return err
+		}
 		if p.Was == nil {
 			p.Was = was.Was
 		}
@@ -864,6 +950,8 @@ func Save(p Provider) error {
 		}
 		f.Providers[i] = p
 	} else {
+		p.KeyPriceRates = sub2apiKeyPriceRates(p)
+		p.Sub2API = importedSub2APIBinding(p)
 		f.Providers = append(f.Providers, p)
 	}
 	if err := store(f); err != nil {
@@ -999,6 +1087,18 @@ func AddCopy(p Provider, from string) (string, error) {
 	}
 	if p.BalanceToken == "" {
 		p.BalanceToken = src.BalanceToken
+	}
+	if p.Sub2API == nil {
+		p.Sub2API = cloneSub2APIBinding(src.Sub2API)
+	}
+	if p.KeyPriceRates == nil {
+		p.KeyPriceRates = sub2apiKeyPriceRates(*src)
+	}
+	if err := keepSub2APIBinding(&p); err != nil {
+		return "", err
+	}
+	if p.Sub2API != nil {
+		p.Sub2API = importedSub2APIBinding(p)
 	}
 	// the access key as the copy's editor showed it: the form sends its ID
 	// but never the saved Secret, which went missing from the copy (#1821)

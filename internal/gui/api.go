@@ -1122,6 +1122,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		writeJSON(rw, state())
 	})
 	providerRoutes(mux, w)
+	sub2apiRoutes(mux, w)
 	importRoutes(mux)
 	usageRoutes(mux, w)
 	callerKeyRoutes(mux)
@@ -2431,7 +2432,11 @@ func writeJSON(rw http.ResponseWriter, v any) {
 
 func fail(rw http.ResponseWriter, err error) {
 	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(http.StatusBadRequest)
+	status := http.StatusBadRequest
+	if errors.Is(err, provider.ErrConfigConflict) || errors.Is(err, provider.ErrSub2APIConflict) {
+		status = http.StatusConflict
+	}
+	rw.WriteHeader(status)
 	out := map[string]string{"error": err.Error()}
 	var unavailable *agent.RuntimeUnavailableError
 	if errors.As(err, &unavailable) {

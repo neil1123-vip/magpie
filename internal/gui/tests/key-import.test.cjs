@@ -103,7 +103,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(body.key, "sk-one\nsk-two, sk-three\n\nsk-two");
       await page.locator('.acc[data-account-id="dddddddddd"]').waitFor();
       assert.equal(await page.locator(".acc.adding").count(), 0, "the box stays open");
+      await page.waitForFunction((note) => document.querySelector("#status").textContent.trim() === note, w.note);
       assert.equal((await page.locator("#status").textContent()).trim(), w.note);
+      assert.equal(posts.length, 1, "the keys are imported once");
       assert.deepEqual(errors, []);
     });
 

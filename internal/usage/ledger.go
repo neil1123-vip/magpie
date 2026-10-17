@@ -510,7 +510,8 @@ var ownPrice catalog.Price
 
 // Pricer uses the same effective price as the model CLI and session totals:
 // explicit provider/model or provider-wide prices (including zero), then the
-// provider catalog, then the maker catalog. Settings are read once per query.
+// provider catalog, then the maker catalog, at the actual key's local rate
+// when known. Settings are read once per query.
 //
 // A model no price is known for is priced as the model the vendor's reply
 // said answered (Served), at the same provider, when that one has a price:
@@ -519,7 +520,7 @@ var ownPrice catalog.Price
 // has one, a zero set by the user included, so a ledger that matched the
 // vendor's bill still does.
 func Pricer() func(Record) *catalog.Price {
-	prices := map[[3]string]*catalog.Price{}
+	prices := map[[4]string]*catalog.Price{}
 	s := settings.Load()
 	return func(r Record) *catalog.Price {
 		if r.OwnCost != nil {
@@ -529,14 +530,14 @@ func Pricer() func(Record) *catalog.Price {
 		if served == r.Model {
 			served = ""
 		}
-		k := [3]string{r.Provider, r.Model, served}
+		k := [4]string{r.Provider, r.Model, served, r.ProviderKeyID}
 		if pr, ok := prices[k]; ok {
 			return pr
 		}
 		var pr *catalog.Price
-		v, ok := provider.EffectivePriceIn(s, r.Provider, r.Model)
+		v, ok := provider.EffectiveKeyPriceIn(s, r.Provider, r.Model, r.ProviderKeyID)
 		if !ok && served != "" {
-			v, ok = provider.EffectivePriceIn(s, r.Provider, served)
+			v, ok = provider.EffectiveKeyPriceIn(s, r.Provider, served, r.ProviderKeyID)
 		}
 		if ok {
 			pr = &v

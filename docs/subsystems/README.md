@@ -14,6 +14,7 @@ These pages describe current responsibilities, runtime paths, state, and contrac
 | Gateway Session Aggregation | [Gateway Session Aggregation](gateway-sessions.md) |
 | Connecting an agent's config to the gateway, drift, disconnect, WSL twins | [Agent wiring](agent-wiring.md) |
 | Providers, keys, subscription accounts, refresh and allowance | [Providers and accounts](providers-accounts.md) |
+| Sub2API panel sign-in, existing balances, background groups and rates, Windows browser verification | [Sub2API accounts and group rates](sub2api.md) |
 | Instructions, MCP servers, skills and RTK written into agents | [Library](library.md) |
 | Tray, panel, window, `magpie web` and the page's JSON API | [GUI app shell](gui-shell.md) |
 | Encrypted backups and setup synchronization over WebDAV, S3 or GitHub | [Sync and backup](sync-backup.md) |
