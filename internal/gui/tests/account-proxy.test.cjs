@@ -147,12 +147,22 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert(await addr(page, "Third@Example.com").isHidden());
       assert.equal(await page.locator(".editor .proxy-pick .proxy-url").inputValue(), "http://10.0.0.2:7890", "Codex's own is kept above");
 
-      // saved untouched, it posts what it has
+      // Saved untouched, the independently stored proxies are left out.
       let saved = await save(page, posts);
       assert.equal(saved.action, "save");
       assert.equal(saved.body.id, "codex");
       assert.equal(saved.body.proxy, "http://10.0.0.2:7890");
-      assert.deepEqual(saved.body.accountProxies, { "me@example.com": "socks5://10.0.0.5:1080", "spare@example.com": "direct" });
+      assert.equal(saved.body.accountProxies, undefined);
+
+      // A fresh list may carry an independent proxy change; this draft
+      // did not edit its proxies and must not replay the old map.
+      await page.locator(".row.provider", { hasText: "Codex" }).first().click();
+      await page.evaluate(() => {
+        providers.providers.find((p) => p.id === "codex").accountProxies = { "spare@example.com": "http://changed.example:8080" };
+        renderProviders();
+      });
+      saved = await save(page, posts);
+      assert.equal(saved.body.accountProxies, undefined, "a redraw keeps the original comparison");
 
       // Custom for the third with nothing typed is refused, nothing posted
       await page.locator(".row.provider", { hasText: "Codex" }).first().click();
@@ -175,6 +185,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.deepEqual(saved.body.accountProxies, { "me@example.com": "direct", "third@example.com": "http://10.0.0.7:3128" });
       assert.deepEqual(saved.body.models, ["gpt-6"], "its picks go with it");
 
+      await page.locator(".row.provider", { hasText: "Codex" }).first().click();
+      await pick(page, "me@example.com", w.prov);
+      await pick(page, "spare@example.com", w.prov);
+      saved = await save(page, posts);
+      assert.deepEqual(saved.body.accountProxies, {}, "clearing all account overrides is explicit");
+
       const border = await page.evaluate(() => [...document.querySelectorAll(".acct-proxies, .acct-proxies *")].map((e) => getComputedStyle(e).borderLeftWidth).filter((b) => parseFloat(b) > 1));
       assert.deepEqual(border, [], "no border stripes");
       const missing = await page.evaluate(() => [
@@ -191,7 +207,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await page.locator(".editor .acct-proxies").count(), 0);
       const saved = await save(page, posts);
       assert.equal(saved.body.id, "claude");
-      assert.deepEqual(saved.body.accountProxies, {});
+      assert.equal(saved.body.accountProxies, undefined);
       assert.deepEqual(errors, []);
     });
 
@@ -212,7 +228,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       let saved = await save(page, posts);
       assert.equal(saved.body.id, "relay");
       assert.equal(saved.body.proxy, "http://10.0.0.2:7890");
-      assert.deepEqual(saved.body.accountProxies, { aaaaaaaaaa: "socks5://10.0.0.5:1080", bbbbbbbbbb: "direct" });
+      assert.equal(saved.body.accountProxies, undefined);
 
       // Custom for Spare with nothing typed is refused by its name
       await page.locator(".row.provider", { hasText: "Relay" }).first().click();
@@ -228,8 +244,18 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await addr(page, "cccccccccc").fill(" http://10.0.0.7:3128 ");
       await pick(page, "bbbbbbbbbb", w.prov);
       await pick(page, "aaaaaaaaaa", w.direct);
+      await page.evaluate(() => {
+        providers.providers.find((p) => p.id === "relay").accountProxies = { aaaaaaaaaa: "direct", cccccccccc: "http://10.0.0.7:3128" };
+        renderProviders();
+      });
       saved = await save(page, posts);
-      assert.deepEqual(saved.body.accountProxies, { aaaaaaaaaa: "direct", cccccccccc: "http://10.0.0.7:3128" });
+      assert.deepEqual(saved.body.accountProxies, { aaaaaaaaaa: "direct", cccccccccc: "http://10.0.0.7:3128" }, "an edited map is compared with the opening snapshot");
+
+      await page.locator(".row.provider", { hasText: "Relay" }).first().click();
+      await pick(page, "aaaaaaaaaa", w.prov);
+      await pick(page, "bbbbbbbbbb", w.prov);
+      saved = await save(page, posts);
+      assert.deepEqual(saved.body.accountProxies, {}, "clearing all key overrides is explicit");
       assert.deepEqual(errors, []);
     });
 

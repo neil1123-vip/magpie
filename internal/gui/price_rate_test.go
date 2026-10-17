@@ -62,14 +62,15 @@ func TestAccountSaveKeepsPriceRate(t *testing.T) {
 	}
 	mux := http.NewServeMux()
 	providerRoutes(mux, nil)
-	rate := func() any {
+	rate := func() (float64, string) {
 		t.Helper()
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest("GET", "/api/providers", nil))
 		var got struct {
 			Providers []struct {
-				ID        string  `json:"id"`
-				PriceRate float64 `json:"priceRate"`
+				ID           string  `json:"id"`
+				PriceRate    float64 `json:"priceRate"`
+				SaveRevision string  `json:"saveRevision"`
 			} `json:"providers"`
 		}
 		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
@@ -77,22 +78,25 @@ func TestAccountSaveKeepsPriceRate(t *testing.T) {
 		}
 		for _, p := range got.Providers {
 			if p.ID == "codex" {
-				return p.PriceRate
+				return p.PriceRate, p.SaveRevision
 			}
 		}
-		return "no codex"
+		t.Fatal("no codex")
+		return 0, ""
 	}
 	for _, c := range []struct {
 		send string
 		want float64
 	}{{"0.8", 0.8}, {"1.5", 1.5}, {"null", 0}} {
+		_, revision := rate()
+		encodedRevision, _ := json.Marshal(revision)
 		w := httptest.NewRecorder()
-		body := `{"id":"codex","models":[],"noModels":false,"unlisted":false,"fallback":[],"contexts":{},"outputs":{},"compacts":{},"proxy":"","accountProxies":{},"maxConcurrency":null,"queueLimit":0,"queueWait":0,"maxRPM":0,"priceRate":` + c.send + `,"modelPrefs":{},"pinUpstream":false}`
+		body := `{"id":"codex","saveRevision":` + string(encodedRevision) + `,"models":[],"noModels":false,"unlisted":false,"fallback":[],"contexts":{},"outputs":{},"compacts":{},"proxy":"","accountProxies":{},"maxConcurrency":null,"queueLimit":0,"queueWait":0,"maxRPM":0,"priceRate":` + c.send + `,"modelPrefs":{},"pinUpstream":false}`
 		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(body)))
 		if w.Code != 200 {
 			t.Fatalf("%s: %d %s", c.send, w.Code, w.Body)
 		}
-		if got := rate(); got != c.want {
+		if got, _ := rate(); got != c.want {
 			t.Fatalf("saved %s, read back %v", c.send, got)
 		}
 	}

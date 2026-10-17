@@ -23,6 +23,9 @@ func TestProviderSaveSplitsKeysAndRemovesMany(t *testing.T) {
 	providerRoutes(mux, nil)
 	post := func(path, body string) string {
 		t.Helper()
+		if path == "/api/provider/save" {
+			body = currentProviderForm(t, body)
+		}
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest("POST", path, strings.NewReader(body)))
 		if w.Code != 200 {

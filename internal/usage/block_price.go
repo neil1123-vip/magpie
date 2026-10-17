@@ -14,7 +14,7 @@ import (
 const swapKnown = 64
 
 // pricedAs is what a gateway call is priced as, the same for every call of
-// one provider, model, served model and effort.
+// one provider, model, served model, effort and key.
 type pricedAs struct {
 	provider string
 	flags    uint16
@@ -32,7 +32,7 @@ type blockPricer struct {
 	renames provider.Renames
 	wires   map[string]string
 	price   func(Record) *catalog.Price
-	by      map[[4]string]pricedAs
+	by      map[[5]string]pricedAs
 	agents  map[string][2]string
 	// meta names what prices and names a call (requestState.meta): the
 	// blocks priced of it are shared with the other queries reading now
@@ -154,14 +154,14 @@ func (b *blockPricer) release() {
 }
 
 func newBlockPricer(renames provider.Renames, wires map[string]string, price func(Record) *catalog.Price) *blockPricer {
-	return &blockPricer{renames: renames, wires: wires, price: price, by: map[[4]string]pricedAs{}, agents: map[string][2]string{}}
+	return &blockPricer{renames: renames, wires: wires, price: price, by: map[[5]string]pricedAs{}, agents: map[string][2]string{}}
 }
 
 // as is priceRow's answer for a gateway call of these names, prov the
 // id the provider has now without a merge (Renames.Own): what it is
 // shown under does not change what it cost.
-func (b *blockPricer) as(prov, model, served, effort string) pricedAs {
-	k := [4]string{prov, model, served, effort}
+func (b *blockPricer) as(prov, model, served, effort, keyID string) pricedAs {
+	k := [5]string{prov, model, served, effort, keyID}
 	if a, ok := b.by[k]; ok {
 		return a
 	}
@@ -173,7 +173,7 @@ func (b *blockPricer) as(prov, model, served, effort string) pricedAs {
 	if GroupRouted(sent, served) {
 		a.flags |= 32
 	}
-	a.price = b.price(Record{Provider: prov, Model: model, Served: served, Effort: effort})
+	a.price = b.price(Record{Provider: prov, Model: model, Served: served, Effort: effort, ProviderKeyID: keyID})
 	a.windows = provider.RateWindowsOf(prov)
 	b.by[k] = a
 	return a
@@ -275,7 +275,7 @@ func (b *blockPricer) priceBlock(packed *rowChunk) (*rowChunk, *[]packedRow) {
 		price   *catalog.Price
 		windows []provider.RateWindow
 	}
-	names := map[[6]uint32]ids{}
+	names := map[[7]uint32]ids{}
 	agents := map[uint32][2]uint32{}
 	shapes := map[[3]uint32]ids{}
 	// the provider each shape names, as it is now: one an id was given
@@ -307,10 +307,10 @@ func (b *blockPricer) priceBlock(packed *rowChunk) (*rowChunk, *[]packedRow) {
 		got, ok := shapes[sk]
 		if !ok {
 			t := c.Shapes[p.Shape]
-			k := [6]uint32{t[1], t[5], t[7], t[8], to.to, to.own}
+			k := [7]uint32{t[1], t[5], t[7], t[8], to.to, to.own, t[18]}
 			named, ok := names[k]
 			if !ok {
-				a := b.as(c.Strings[k[5]], c.Strings[k[1]], c.Strings[k[2]], c.Strings[k[3]])
+				a := b.as(c.Strings[k[5]], c.Strings[k[1]], c.Strings[k[2]], c.Strings[k[3]], c.Strings[k[6]])
 				named = ids{k[4], a.flags, a.price, a.windows}
 				names[k] = named
 			}

@@ -3489,6 +3489,7 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
 .detect-out .detect-say.err { color: var(--red); }
 .detect-row .detect-each { flex: none; }
 .native-test .detect-row { flex-wrap: wrap; }
+.native-test label.tick { min-width: 0; max-width: 100%; }
 .native-test-out[hidden] { display: none; }
 .native-test-out .hint { overflow-wrap: anywhere; }
 .native-test-out .ok { color: var(--green); }

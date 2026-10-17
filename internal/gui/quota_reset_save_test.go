@@ -31,7 +31,7 @@ func TestSaveKeepsQuotaResetAt(t *testing.T) {
 	mux := http.NewServeMux()
 	providerRoutes(mux, nil)
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(`{"id":"reset-test","name":"Reset","chat":"https://example.invalid/v1"}`)))
+	mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(currentProviderForm(t, `{"id":"reset-test","name":"Reset","chat":"https://example.invalid/v1"}`))))
 	if w.Code != 200 {
 		t.Fatalf("%d %s", w.Code, w.Body)
 	}

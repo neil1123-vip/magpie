@@ -515,7 +515,8 @@ var ownPrice catalog.Price
 
 // Pricer uses the same effective price as the model CLI and session totals:
 // explicit provider/model or provider-wide prices (including zero), then the
-// provider catalog, then the maker catalog. Settings are read once per query.
+// provider catalog, then the maker catalog, at the actual key's local rate
+// when known. Settings are read once per query.
 //
 // A model no price is known for is priced as the model the vendor's reply
 // said answered (Served), at the same provider, when that one has a price:
@@ -538,7 +539,7 @@ var ownPrice catalog.Price
 // one whose other models alone would stand for this call's, prices
 // nothing (#4278).
 func Pricer() func(Record) *catalog.Price {
-	prices := map[[5]string]*catalog.Price{}
+	prices := map[[6]string]*catalog.Price{}
 	// each provider's rate windows as the same read of the prices saw
 	// them: the windows are held once (BasePriceIn), each record's rate
 	// read at its own time (provider.RateAt), so a window that opens
@@ -555,7 +556,7 @@ func Pricer() func(Record) *catalog.Price {
 			served = ""
 		}
 		id := r.priceID()
-		k := [5]string{id, r.Model, served, r.SessionProvider, r.Effort}
+		k := [6]string{id, r.Model, served, r.SessionProvider, r.Effort, r.ProviderKeyID}
 		if pr, ok := prices[k]; ok {
 			return atWindow(pr, windows[id], r.Time)
 		}
@@ -571,15 +572,15 @@ func Pricer() func(Record) *catalog.Price {
 			if v, ok, ws = provider.UserBasePriceIn(s, id, r.Model); !ok {
 				// the model that ran is priced as itself, what the vendor
 				// billed; with none, the asked-for one's price stands
-				if v, ok, ws = provider.BasePriceIn(s, id, served); !ok {
-					v, ok, ws = provider.BasePriceIn(s, id, r.Model)
+				if v, ok, ws = provider.BaseKeyPriceIn(s, id, served, r.ProviderKeyID); !ok {
+					v, ok, ws = provider.BaseKeyPriceIn(s, id, r.Model, r.ProviderKeyID)
 				}
 			}
 		} else {
-			v, ok, ws = provider.BasePriceIn(s, id, r.Model)
+			v, ok, ws = provider.BaseKeyPriceIn(s, id, r.Model, r.ProviderKeyID)
 		}
 		if !ok && served != "" {
-			v, ok, ws = provider.BasePriceIn(s, id, served)
+			v, ok, ws = provider.BaseKeyPriceIn(s, id, served, r.ProviderKeyID)
 		}
 		if ok {
 			pr = &v

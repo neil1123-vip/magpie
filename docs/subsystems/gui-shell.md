@@ -7,6 +7,20 @@ with no binding generator and no bundler. `magpie web` serves the same page
 to a browser for a machine with no desktop. Package `internal/gui` hosts all
 three.
 
+The source editor's Sub2API sign-in and Usage's Sub2API groups tab use a
+desktop-gated API. Their account lifecycle, background monitor and isolated
+Windows browser host are described in
+[Sub2API accounts and group rates](sub2api.md).
+
+Windows desktop builds also use the pinned
+[toast factory patch](../../build/sub2api-webview2/README.md).
+It supplies the COM receiver and releases the activation factory for both
+notification manager lookup and toast creation. The upstream null receiver
+can terminate the app when a background notification fires; ordinary Wails
+alerts and Sub2API alerts share this dependency. The prepared modfile is
+required for this fix. `TestToastFactories` calls both real Windows factories
+in separate child processes without displaying notifications.
+
 ## Responsibilities and sources of truth
 
 | Part | Responsibility | Source |
@@ -53,6 +67,36 @@ Once prepared, the row slides to its full height; reduced motion opens it
 at once. Later openings reuse the settings and controls already loaded.
 `agent-details-ready.test.cjs` holds both responses and checks the final
 animation frame against the natural height in both engines and five languages.
+
+### Provider-list ordering
+
+`api` in [`app.js`](../../internal/gui/assets/app.js) coordinates shared
+`providers` reads and source, key and account writes. Reads begun before a
+write finishes follow a current read, on success or failure. A late provider
+list cannot undo an acknowledged source edit or price application. Each new
+read makes its own request, so a newly opened page can finish while an older
+page's request is pending; `providers?wait=1` keeps its wait semantics.
+`providers?last=1` reads a cached placeholder independently: it neither
+supersedes nor invalidates a live read, even when it arrives later or returns
+null. The Providers loader replaces this placeholder with the live list.
+Writes run once; if overlapping writes or an accepted read after a write
+began make its returned list uncertain, only the list is read again. This
+also covers a read that observed another window's change, and a read that
+finished before the pending write committed. Calls with their own
+response-header callback or cancellation signal
+keep independent requests and cancellation.
+
+Source saves capture the editor and draft before saving account-model picks
+or plugin options. Both subscription and API-key forms send the stored source
+revision and stop another save after a conflict. A delayed success or failure
+can close or mark only that original editor; a later editor and its unsaved
+model picker stay intact. Plugin options use the choices captured on Save,
+and a completed account-model write clears only the unchanged picker it saved.
+`provider-save-ownership.test.cjs` checks these transitions in both engines.
+Account and key proxies are compared with the values when the editor opened.
+An unchanged map is omitted from Save so independent key changes keep their
+latest proxy mappings; an edited map is sent explicitly, including an empty
+object to clear it. A redraw does not replace that original comparison.
 
 ### Allowance card refreshes
 

@@ -23,6 +23,7 @@ func TestProviderSaveModelPrefs(t *testing.T) {
 	providerRoutes(mux, nil)
 	post := func(body string) *httptest.ResponseRecorder {
 		t.Helper()
+		body = currentProviderForm(t, body)
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(body)))
 		return w

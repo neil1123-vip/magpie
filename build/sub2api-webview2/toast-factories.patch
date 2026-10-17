@@ -1,0 +1,107 @@
+diff --git a/internal/winrt/ui/notifications/toastnotificationmanager.go b/internal/winrt/ui/notifications/toastnotificationmanager.go
+--- a/internal/winrt/ui/notifications/toastnotificationmanager.go
++++ b/internal/winrt/ui/notifications/toastnotificationmanager.go
+@@ -36,11 +36,12 @@ func GetDefault() (*ToastNotificationManagerForUser, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	defer inspectable.Release()
+ 	v := (*iToastNotificationManagerStatics5)(unsafe.Pointer(inspectable))
+ 
+ 	var out *ToastNotificationManagerForUser
+ 	hr, _, _ := syscall.SyscallN(
+ 		v.VTable().GetDefault,
+-		0,                             // this is a static func, so there's no this
++		uintptr(unsafe.Pointer(v)),    // this
+ 		uintptr(unsafe.Pointer(&out)), // out ToastNotificationManagerForUser
+ 	)
+diff --git a/internal/winrt/ui/notifications/toastnotification.go b/internal/winrt/ui/notifications/toastnotification.go
+--- a/internal/winrt/ui/notifications/toastnotification.go
++++ b/internal/winrt/ui/notifications/toastnotification.go
+@@ -20,11 +20,12 @@ func CreateToastNotification(content *dom.XmlDocument) (*ToastNotification, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	defer inspectable.Release()
+ 	v := (*iToastNotificationFactory)(unsafe.Pointer(inspectable))
+ 
+ 	var out *ToastNotification
+ 	hr, _, _ := syscall.SyscallN(
+ 		v.VTable().CreateToastNotification,
+-		0,                                // this is a static func, so there's no this
++		uintptr(unsafe.Pointer(v)),       // this
+ 		uintptr(unsafe.Pointer(content)), // in dom.XmlDocument
+ 		uintptr(unsafe.Pointer(&out)),    // out ToastNotification
+diff --git a/internal/winrt/ui/notifications/factories_windows_test.go b/internal/winrt/ui/notifications/factories_windows_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/winrt/ui/notifications/factories_windows_test.go
+@@ -0,0 +1,68 @@
++package notifications
++
++import (
++	"errors"
++	"os"
++	"os/exec"
++	"runtime"
++	"testing"
++
++	"git.sr.ht/~jackmordaunt/go-toast/v2/internal/winrt/data/xml/dom"
++	"github.com/go-ole/go-ole"
++	"golang.org/x/sys/windows"
++)
++
++func TestToastFactories(t *testing.T) {
++	if mode := os.Getenv("MAGPIE_TEST_TOAST_FACTORY"); mode != "" {
++		runtime.LockOSThread()
++		defer runtime.UnlockOSThread()
++		// Match WebView2's STA; MTA can hide upstream's null receiver.
++		if err := ole.RoInitialize(0); err != nil {
++			var oleErr *ole.OleError
++			if !errors.As(err, &oleErr) || oleErr.Code() != 1 {
++				t.Fatal(err)
++			}
++		}
++		defer windows.NewLazySystemDLL("combase.dll").NewProc("RoUninitialize").Call()
++		switch mode {
++		case "manager":
++			manager, err := GetDefault()
++			if err != nil {
++				t.Fatal(err)
++			}
++			if manager == nil {
++				t.Fatal("nil notification manager")
++			}
++			manager.Release()
++		case "notification":
++			doc, err := dom.NewXmlDocument()
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer doc.Release()
++			if err := doc.LoadXml(`<toast><visual><binding template="ToastGeneric"><text>test</text></binding></visual></toast>`); err != nil {
++				t.Fatal(err)
++			}
++			toast, err := CreateToastNotification(doc)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if toast == nil {
++				t.Fatal("nil toast notification")
++			}
++			toast.Release()
++		default:
++			t.Fatalf("unknown factory %q", mode)
++		}
++		return
++	}
++	for _, mode := range []string{"manager", "notification"} {
++		t.Run(mode, func(t *testing.T) {
++			cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestToastFactories$")
++			cmd.Env = append(os.Environ(), "MAGPIE_TEST_TOAST_FACTORY="+mode)
++			if out, err := cmd.CombinedOutput(); err != nil {
++				t.Fatalf("%s factory crashed or failed: %v\n%s", mode, err, out)
++			}
++		})
++	}
++}

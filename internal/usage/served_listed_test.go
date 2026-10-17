@@ -87,10 +87,10 @@ func TestKeptRowListedNameNotSwapped(t *testing.T) {
 func TestBlockPricerListedNameNotSwapped(t *testing.T) {
 	listedAs(t, map[string]map[string]string{"qoder": {"qfmodel": "Qwen3.8-Flash"}})
 	b := newBlockPricer(provider.Renames{}, nil, func(Record) *catalog.Price { return nil })
-	if a := b.as("qoder", "qfmodel", "Qwen3.8-Flash", ""); a.flags&2 != 0 {
+	if a := b.as("qoder", "qfmodel", "Qwen3.8-Flash", "", ""); a.flags&2 != 0 {
 		t.Fatalf("listed name priced as a swap: %b", a.flags)
 	}
-	if a := b.as("qoder", "qfmodel", "Qwen3.7-Flash", ""); a.flags&2 == 0 {
+	if a := b.as("qoder", "qfmodel", "Qwen3.7-Flash", "", ""); a.flags&2 == 0 {
 		t.Fatalf("another model priced as not swapped: %b", a.flags)
 	}
 }

@@ -7,6 +7,7 @@ import (
 
 	"github.com/yetone/magpie/internal/cli"
 	"github.com/yetone/magpie/internal/notices"
+	"github.com/yetone/magpie/internal/sub2apibrowser"
 	// the built-in plugins, registered with the runtime (internal/pluginrt)
 	_ "github.com/yetone/magpie/plugins/all"
 )
@@ -24,5 +25,8 @@ var thirdParty string
 
 func main() {
 	notices.Text = thirdParty
+	if sub2apibrowser.MaybeRun() {
+		return
+	}
 	cli.Main(version)
 }

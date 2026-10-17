@@ -45,6 +45,7 @@ func Restore(ps []Provider) (added, replaced int, err error) {
 		}
 		if i < 0 {
 			p.KeepSelf = false
+			p.Sub2API = importedSub2APIBinding(p)
 			f.Providers = append(f.Providers, p)
 			added++
 			continue
@@ -122,6 +123,7 @@ func Mirror(ps []Provider, gs []Group) error {
 		} else {
 			p.KeepLoginAs = "" // an account signed in on the other computer
 			p.KeepSelf = false // kept on the other computer, of a magpie that isn't this one
+			p.Sub2API = importedSub2APIBinding(p)
 		}
 		out = append(out, p)
 	}

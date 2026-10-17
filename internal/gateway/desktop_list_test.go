@@ -180,6 +180,10 @@ func TestDesktopInferenceModelsNamed(t *testing.T) {
 	if err := provider.SetContext(*p, "gpt-6.1-sol", 400_000); err != nil {
 		t.Fatal(err)
 	}
+	p, err = provider.Find("ds")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := provider.SetContext(*p, "deepseek-v4.1-flash", 1_000_000); err != nil {
 		t.Fatal(err)
 	}

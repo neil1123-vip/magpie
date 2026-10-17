@@ -181,9 +181,12 @@ type providerJSON struct {
 	// user gives it one
 	AccountUsers map[string]string `json:"accountUsers,omitempty"`
 	// where a custom provider's balance is asked (see provider.Balance)
-	BalanceURL    string `json:"balanceURL,omitempty"`
-	BalancePath   string `json:"balancePath,omitempty"`
-	BalanceMethod string `json:"balanceMethod,omitempty"`
+	BalanceURL      string                   `json:"balanceURL,omitempty"`
+	BalancePath     string                   `json:"balancePath,omitempty"`
+	BalanceMethod   string                   `json:"balanceMethod,omitempty"`
+	Sub2API         *provider.Sub2APIBinding `json:"sub2api,omitempty"`
+	Sub2APIRevision string                   `json:"sub2apiRevision,omitempty"`
+	SaveRevision    string                   `json:"saveRevision"`
 	// the query magpie found by itself for a relay added by hand with no
 	// Balance URL, and its field (provider.BalanceFound)
 	BalanceFound      string `json:"balanceFound,omitempty"`
@@ -733,6 +736,7 @@ func providerInfoWith(p provider.Provider, ls provider.Listing, agents []agentUs
 		Catalog: p.Catalog, Website: p.Website, KeysURL: p.KeysURL,
 		Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountNames: p.AccountNames, Headers: p.Headers, ExtraBody: p.ExtraBody, ReplyHeaders: p.ReplyHeaders, PassHeaders: p.PassHeaders, Searches: p.Searches, Cline: p.ClinePinnable(), PinUpstream: p.PinUpstream, Unredacted: p.Unredacted, CountFree: p.CountFree, InsecureTLS: p.InsecureTLS, TakesInsecureTLS: p.TakesInsecureTLS(), HTTP1: p.HTTP1, LimitRestOff: p.LimitRestOff, ImageFilesOff: p.ImageFilesOff, TakesImageFiles: p.TakesImageFiles(), NativeCompaction: p.NativeCompaction, CarriesCompaction: p.CarriesCompaction(), PassUserAgent: p.PassUserAgent, OwnClient: p.OwnClient(), AuthHeader: p.AuthHeader, BothAuth: p.BothAuth(), BalanceURL: p.BalanceURL, BalancePath: p.BalancePath, BalanceMethod: p.BalanceMethod, ModelsURL: p.ModelsURL,
 		Ready: p.Ready(), Chosen: p.PicksOf(avail), Agents: make([]providerAgent, 0, len(agents)),
+		Sub2API: provider.Sub2APISafeBinding(p), Sub2APIRevision: provider.Sub2APIRevision(p), SaveRevision: p.SaveRevision,
 		Fallback: p.Fallback, Routing: p.Routing, Sink: p.Sink, Affinity: p.Affinity, KeepLogin: p.KeepLogin, KeepLoginAs: p.KeepLoginAs, SwitchOnly: p.SwitchOnly, RestartApp: p.RestartApp, Self: p.SelfAnswered(), KeepSelf: p.KeepSelf, CapStop: p.CapStop, CapCareful: p.CapCareful, Unlisted: p.Unlisted, NoModels: p.ServesNone(), BestInFamily: p.BestInFamily && len(p.Models) == 0 && !p.NoModels, Off: p.Off, Contexts: p.Contexts,
 		MaxConcurrency: p.MaxConcurrency, PluginConcurrency: p.PluginConcurrency(), MaxAccounts: p.MaxAccounts, PluginAccounts: p.PluginAtOnce(), PriceRate: p.PriceRate,
 		RateWindows: p.RateWindows, RateNow: rateNowOf(p, time.Now()),
@@ -1526,7 +1530,8 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			AccessKeyID    *string `json:"accessKeyID"`
 			ClearAccessKey bool    `json:"clearAccessKey"`
 			// From is the id the provider had: another is a rename
-			From string `json:"from"`
+			From         string `json:"from"`
+			SaveRevision string `json:"saveRevision"`
 			// LibraryMCP, on a Remote magpie, is its editor's switch: its
 			// router a Library server (library.SetRemoteMCP); left out,
 			// it stays as it is
@@ -1992,10 +1997,8 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				if in.Patience == 0 && old != nil {
 					in.Patience = old.Patience
 				}
-				// each account's own proxy likewise: {} clears them
-				if in.AccountProxies == nil && old != nil {
-					in.AccountProxies = old.AccountProxies
-				}
+				// Omitted account proxies and keys are kept under the write lock;
+				// {} explicitly clears proxies, and a nonempty key replaces it.
 				// each account's own models are set on their own, with
 				// accountmodels
 				if old != nil {
@@ -2055,9 +2058,6 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				// and a Vertex AI provider's project and credentials
 				if in.Vertex == nil && old != nil {
 					in.Vertex = old.Vertex
-				}
-				if in.Key == "" && old != nil {
-					in.Key = old.Key
 				}
 				if in.BalanceToken == "" && old != nil && !req.ClearBalanceToken {
 					in.BalanceToken = old.BalanceToken
@@ -2125,7 +2125,7 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 					fail(rw, fmt.Errorf("%s can't carry Codex's native compaction: only a provider with a Responses API, a ChatGPT account or GitHub Copilot can", cmp.Or(in.Name, in.ID)))
 					return
 				}
-				if err := provider.Save(in); err != nil {
+				if err := provider.SaveWithRevision(in, req.SaveRevision); err != nil {
 					fail(rw, err)
 					return
 				}
