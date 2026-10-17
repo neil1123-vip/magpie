@@ -250,11 +250,11 @@ func TestMaxImagesStandsOverTheLearnedCap(t *testing.T) {
 	if rec := postCapChat(t, s, imageChat("copilot/gemini-4-carbon", 11, 1)); rec.Code != 200 {
 		t.Fatalf("the turn failed: %d %s", rec.Code, rec.Body.String())
 	}
-	p, err := provider.Find("copilot")
-	if err != nil {
-		t.Fatal(err)
-	}
 	for _, c := range []struct{ own, want int }{{4, 4}, {20, 10}} {
+		p, err := provider.Find("copilot")
+		if err != nil {
+			t.Fatal(err)
+		}
 		p.MaxImages = map[string]int{"*": c.own}
 		if err := provider.Save(*p); err != nil {
 			t.Fatal(err)

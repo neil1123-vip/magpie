@@ -127,14 +127,51 @@ const readTags = new WeakMap();
 
 // heads, when given, is shown the answer's headers (loadQuotas' X-Magpie-Reading);
 // signal, when given, cancels the request (a read the reader moved on from)
+let providerFlight = null, providerWait = false, providerWrites = 0, providerReads = 0;
 async function api(path, body, heads, signal) {
-  // a web link is the browser's to open; an app's import link (cindy://)
-  // is the host's, where that app and its database are
+  if (body === undefined && /^providers(?:\?|$)/.test(path) && !/[?&]last=1(&|$)/.test(path)) {
+    if (heads || signal) {
+      const before = providerWrites;
+      try {
+        const next = await apiRequest(path, body, heads, signal);
+        if (before !== providerWrites) return api(path, body, heads, signal);
+        providerReads++;
+        return next;
+      } catch (error) {
+        if (signal?.aborted || before === providerWrites) throw error;
+        return api(path, body, heads, signal);
+      }
+    }
+    const follow = () => providerFlight && (path === "providers" || providerWait) ? providerFlight : api(path);
+    const pending = apiRequest(path, body, heads, signal).then(
+      (next) => { if (providerFlight !== pending) return follow(); providerReads++; return next; },
+      (error) => { if (providerFlight !== pending) return follow(); throw error; });
+    providerFlight = pending;
+    providerWait = path !== "providers";
+    try { return await pending; } finally { if (providerFlight === pending) providerFlight = null; }
+  }
+  const writing = body !== undefined && /^(providers?(?:\/|$)|sub2api\/|keys\/|login\/|signin\/|stepfun\/|importapps$)/.test(path);
+  const before = providerWrites, reads = providerReads;
+  let result, crossed;
+  try { result = await apiRequest(path, body, heads, signal); }
+  finally {
+    if (writing) { crossed = before !== providerWrites || reads !== providerReads; providerWrites++; providerFlight = null; }
+  }
+  const field = Array.isArray(result?.providers) ? ""
+    : ["state", "providers"].find((key) => Array.isArray(result?.[key]?.providers));
+  if (body !== undefined && field !== undefined) {
+    if (!writing) { crossed = before !== providerWrites || reads !== providerReads; providerWrites++; providerFlight = null; }
+    if (crossed) {
+      const current = await api("providers");
+      return field ? { ...result, [field]: current } : { ...result, ...current };
+    }
+  }
+  return result;
+}
+async function apiRequest(path, body, heads, signal) {
+  // App import links are opened by the host where the app is installed.
   if (web && path === "open" && /^https?:/i.test(body.url)) { window.open(body.url, "_blank", "noopener"); return null; }
-  // a segment may be an agent id, and omp's named profiles are omp#<name>:
-  // left raw, the browser reads #work as the fragment and the request
-  // reaches the default omp row (#1187). Only # is encoded: ? = & stay a
-  // query string, which encodeURIComponent would turn into a 404.
+  // Encode omp#<name>'s # as path text while keeping query delimiters (#1187).
   path = path.replace(/#/g, "%23");
   const same = body === undefined && readsSame(path);
   const had = same ? sameReads.get(path) : undefined;
@@ -161,6 +198,7 @@ async function api(path, body, heads, signal) {
   if (data?.optionLists) for (const a of data.agents) for (const f of a.fields) if (f.list) f.options = data.optionLists[f.list - 1].map((o) => (o = data.options[o]).fastFor == "*" ? { ...o, fastFor: a.id } : o);
   if (!res.ok) {
     const err = new Error(data?.error || `${res.status} ${res.statusText}`);
+    err.status = res.status;
     if (data?.code === "runtime_unavailable") {
       err.code = data.code;
       if (data.offline === "stage" || data.offline === "disconnect") err.offline = data.offline;
@@ -6348,6 +6386,7 @@ function renderProviders(quiet) {
         try { await loadProviders(); } catch (e) { statusErr(e); return; }
         if (!providers.providers.some((x) => x.id === p.id)) return;
       }
+      await window.Sub2API?.cancelEditor();
       reEdit(open ? null : p.id);
     }; // the preset sheet stays as it is under the dialog
     list.append(row);
@@ -7831,6 +7870,7 @@ function reEdit(x) { editing = x; draft = null; renderProviders(); }
 const leaveDraft = async () => !providerDirty() || await confirmDiscard();
 async function cancelEdit(keep) {
   if ((providerDirty() || ((importing || importingApps) && modalFormDirty())) && !(await confirmDiscard())) return false;
+  await window.Sub2API?.cancelEditor();
   if (keep !== true) dropSigningIn(editing);
   editing = null; draft = null; acctModels = null; importing = null; importingApps = null; renderProviders();
   return true;
@@ -7998,9 +8038,10 @@ function billingField() {
 }
 // a provider's hours at its own rate (#2463), drawn by ratewindows.js
 function rateWindowsField() {
-  const box = el("div", "stack rate-windows"), d = draft;
-  import("./ratewindows.js").then(() => rateWindowsPaint(box, d), statusErr);
-  return field(t("Rate windows"), box);
+  const box = el("div", "stack rate-windows"), d = draft, fields = field(t("Rate windows"), box);
+  if (self.rateWindowsPaint) rateWindowsPaint(box, d);
+  else import("./ratewindows.js").then(() => rateWindowsPaint(box, d), statusErr);
+  return fields;
 }
 // pluginOptionsField: a plugin's declared switches (auth.options, #2038),
 // confirmed first where it asks, kept as draft.pluginOptions[key]. Those
@@ -8052,10 +8093,10 @@ function pluginFilterNote(sub) {
     .map((o) => t("Only some models are listed: the plugin option “{option}” is on.", { option: optionWords(o, "label") })).join(" ");
 }
 // savePluginOptions saves the draft's changed plugin options, by its own id.
-async function savePluginOptions(sub) {
+async function savePluginOptions(sub, options) {
   const pid = sub?.plugin?.pid;
   if (!pid) return;
-  for (const [key, on] of Object.entries(draft.pluginOptions || {})) {
+  for (const [key, on] of Object.entries(options || {})) {
     prefs = await writingPrefs(api("settings/plugin-option", { provider: pid, key, on }));
   }
 }
@@ -8197,7 +8238,7 @@ function proxyDraft(p) {
     accountProxies[u] = x === "direct" ? { mode: "direct", url: "" } : x.startsWith("@") ? { mode: "saved", url: "", ref: x } : { mode: "custom", url: x };
   }
   const ref = v.startsWith("@");
-  return { proxyMode: !v ? "" : v === "direct" ? "direct" : ref ? "saved" : "custom", proxyURL: v && v !== "direct" && !ref ? v : "", proxyRef: ref ? v : "", accountProxies };
+  return { proxyMode: !v ? "" : v === "direct" ? "direct" : ref ? "saved" : "custom", proxyURL: v && v !== "direct" && !ref ? v : "", proxyRef: ref ? v : "", accountProxies, proxyBase: { ...p?.accountProxies } };
 }
 // asTyped: the editor's form as it stands, for Refresh and the Tests to
 // ask with before a Save — a key just pasted over the saved one is the one
@@ -8358,7 +8399,8 @@ function accountProxiesOfDraft() {
       out[u] = v;
     }
   }
-  return { map: out };
+  const base = draft.proxyBase || {};
+  return { map: out, changed: Object.keys({ ...out, ...base }).some((k) => out[k] !== base[k]) };
 }
 
 // a key's own price rate (@tnt12231 on X), in keyrates.js, and any other
@@ -9384,9 +9426,9 @@ function thumbRefit(box) {
   thumbPut(th, to);
   if (control) thumbs.set(control, { th, pick, to });
 }
-const thumbFit = new ResizeObserver((es) => {
+const thumbFit = new ResizeObserver((es) => requestAnimationFrame(() => {
   for (const { target: box } of es) box.isConnected ? thumbRefit(box) : thumbFit.unobserve(box);
-});
+}));
 addEventListener("resize", () => document.querySelectorAll(".segs").forEach(thumbRefit));
 function slide(box, key) { slides([[box, key]]); }
 // every read, then every write
@@ -9484,7 +9526,7 @@ function baseAPIOf(p) {
 
 // draftOf is a saved provider as its editor's form holds it.
 function draftOf(p) {
-  return { id: p.id, name: p.name, preset: p.preset, chat: p.chat, responses: p.responses, anthropic: p.anthropic, gemini: p.gemini || "", catalog: p.catalog, decide: p.decide || "", key: "", api: baseAPIOf(p), chosen: pickedOf(p), none: !!p.noModels, best: !!p.bestInFamily, extra: [], headers: headerRows(p.headers), extraBody: extraBodyText(p.extraBody), replyHeaders: (p.replyHeaders || []).join(", "), passHeaders: (p.passHeaders || []).join(", "), icon: p.icon || "", iconFrom: p.iconFrom || "", fallback: [...(p.fallback || [])], unlisted: !!p.unlisted, hiddenDrawers: [...(p.hiddenDrawers || [])], hiddenVideomakers: [...(p.hiddenVideomakers || [])], searches: !!p.searches, unredacted: !!p.unredacted, countFree: !!p.countFree, billing: p.billing || "", insecureTLS: !!p.insecureTLS, http1: !!p.http1, clientCert: p.clientCert || "", clientKey: p.clientKey || "", serverCA: p.serverCA || "", serverPin: p.serverPin || "", resolve: p.resolve, socket: p.socket || "", limitRestOff: !!p.limitRestOff, noBalanceProbe: !!p.noBalanceProbe, upstreamProviders: !!p.upstreamProviders, passErrors: !!p.passErrors, imageFilesOff: !!p.imageFilesOff, nativeCompaction: !!p.nativeCompaction, passUserAgent: p.passUserAgent !== false, pinUpstream: !!p.pinUpstream, authHeader: p.authHeader || "", balanceURL: p.balanceURL || "", balancePath: p.balancePath || "", balanceMethod: p.balanceMethod || "", modelsURL: p.modelsURL || "", listOff: !!p.listOff, contexts: contextsText(p.contexts), outputs: contextsText(p.outputs), compacts: contextsText(p.compacts), keysUrl: p.keysUrl || "", ...proxyDraft(p), ...concurrencyDraft(p), rateWindows: (p.rateWindows || []).map((w) => ({ ...w })) };
+  return { id: p.id, name: p.name, preset: p.preset, saveRevision: p.saveRevision || "", chat: p.chat, responses: p.responses, anthropic: p.anthropic, gemini: p.gemini || "", catalog: p.catalog, decide: p.decide || "", key: "", api: baseAPIOf(p), chosen: pickedOf(p), none: !!p.noModels, best: !!p.bestInFamily, extra: [], headers: headerRows(p.headers), extraBody: extraBodyText(p.extraBody), replyHeaders: (p.replyHeaders || []).join(", "), passHeaders: (p.passHeaders || []).join(", "), icon: p.icon || "", iconFrom: p.iconFrom || "", fallback: [...(p.fallback || [])], unlisted: !!p.unlisted, hiddenDrawers: [...(p.hiddenDrawers || [])], hiddenVideomakers: [...(p.hiddenVideomakers || [])], searches: !!p.searches, unredacted: !!p.unredacted, countFree: !!p.countFree, billing: p.billing || "", insecureTLS: !!p.insecureTLS, http1: !!p.http1, clientCert: p.clientCert || "", clientKey: p.clientKey || "", serverCA: p.serverCA || "", serverPin: p.serverPin || "", resolve: p.resolve, socket: p.socket || "", limitRestOff: !!p.limitRestOff, noBalanceProbe: !!p.noBalanceProbe, upstreamProviders: !!p.upstreamProviders, passErrors: !!p.passErrors, imageFilesOff: !!p.imageFilesOff, nativeCompaction: !!p.nativeCompaction, passUserAgent: p.passUserAgent !== false, pinUpstream: !!p.pinUpstream, authHeader: p.authHeader || "", balanceURL: p.balanceURL || "", balancePath: p.balancePath || "", balanceMethod: p.balanceMethod || "", modelsURL: p.modelsURL || "", listOff: !!p.listOff, contexts: contextsText(p.contexts), outputs: contextsText(p.outputs), compacts: contextsText(p.compacts), keysUrl: p.keysUrl || "", ...proxyDraft(p), ...concurrencyDraft(p), rateWindows: (p.rateWindows || []).map((w) => ({ ...w })) };
 }
 
 // duplicateProvider opens the Add form on a copy of p, its key p's unless another is pasted (#268).
@@ -9492,7 +9534,7 @@ function duplicateProvider(p) {
   const name = t("{name} copy", { name: p.name });
   editing = p.preset && providers.presets.some((x) => x.id === p.preset) ? { preset: p.preset } : { custom: true };
   const d = draftOf(p);
-  draft = { ...d, id: slug(name), name, chosen: [], extra: d.chosen, copyOf: p.id };
+  draft = { ...d, id: slug(name), name, saveRevision: "", chosen: [], extra: d.chosen, copyOf: p.id };
   if (p.zhipuTeam) draft.zhipuTeam = { org: p.zhipuTeam.org || "", project: p.zhipuTeam.project || "" };
   if (p.vertex) draft.vertex = { project: p.vertex.project || "", location: p.vertex.location || "", credentials: p.vertex.credentials || "", impersonate: p.vertex.impersonate || "", baseUrl: p.vertex.baseUrl || "" };
   renderProviders();
@@ -9835,6 +9877,7 @@ function drawEditor(p, presetID) {
     const cancel = el("button", "text ed-cancel", t("Cancel"));
     cancel.onclick = cancelEdit;
     const saveBtn = el("button", "text primary", t("Save"));
+    saveBtn.disabled = !!draft.saveRevisionConflict;
     saveBtn.onclick = () => {
       if (pickingNone()) return editorError(t("Pick a model first."), "warn");
       const cx = parseContexts(draft.contexts || "");
@@ -9866,9 +9909,11 @@ function drawEditor(p, presetID) {
       if (priceTypedError(ed)) return;
       const picked = accountModelsDraft(p);
       if (picked === false) return pickError();
-      const body = { id: p.id, models: chosenIds(), noModels: noneChosen(), bestInFamily: bestChosen(), unlisted: draft.unlisted, hiddenDrawers: draft.hiddenDrawers, hiddenVideomakers: draft.hiddenVideomakers, fallback: draft.fallback, contexts: cx.map, outputs: ox.map, compacts: cpx.map, maxImages, proxy, accountProxies: own.map, maxConcurrency, maxAccounts, ...queue, priceRate, rateWindows, modelPrefs: modelPrefsOfDraft(), pinUpstream: !!draft.pinUpstream, unredacted: !!draft.unredacted, countFree: !!draft.countFree, billing: draft.billing || "", ...(p.carriesCompaction ? { nativeCompaction: !!draft.nativeCompaction } : {}), ...routingOfDraft(p) };
+      const body = { id: p.id, saveRevision: draft.saveRevision, models: chosenIds(), noModels: noneChosen(), bestInFamily: bestChosen(), unlisted: draft.unlisted, hiddenDrawers: draft.hiddenDrawers, hiddenVideomakers: draft.hiddenVideomakers, fallback: draft.fallback, contexts: cx.map, outputs: ox.map, compacts: cpx.map, maxImages, proxy, ...(own.changed ? { accountProxies: own.map } : {}), maxConcurrency, maxAccounts, ...queue, priceRate, rateWindows, modelPrefs: modelPrefsOfDraft(), pinUpstream: !!draft.pinUpstream, unredacted: !!draft.unredacted, countFree: !!draft.countFree, billing: draft.billing || "", ...(p.carriesCompaction ? { nativeCompaction: !!draft.nativeCompaction } : {}), ...routingOfDraft(p) };
+      const sub = subOf(a.agent), options = { ...draft.pluginOptions };
       saving(saveBtn, t("Saving…"));
-      saveAccountModelsDraft(picked).then(() => savePluginOptions(subOf(a.agent))).then(() => providerAction("save", body, t("{name} saved", { name: p.name })), (e) => { doneSaving(saveBtn); editorError(e.message || String(e)); }); };
+      providerAction("save", body, t("{name} saved", { name: p.name }), "provider/",
+        () => saveAccountModelsDraft(picked).then(() => savePluginOptions(sub, options))); };
     bar.append(cancel, saveBtn);
     ed.append(bar);
     return ed;
@@ -10086,24 +10131,7 @@ function drawEditor(p, presetID) {
 
   if (p?.cline || (isNew && pr?.id === "clinepass")) advIn.append(...upstreamField());
 
-  // a relay that searches the web as its vendor does gets a client's search as sent (#359)
-  const testDraft = () => {
-    const proxy = proxyOfDraft();
-    if (proxy === null) throw new Error(t("Proxy: type its address, like http://127.0.0.1:7890"));
-    const own = accountProxiesOfDraft();
-    if (own.missing) {
-      const line = ed.querySelector(`.acct-proxy[data-key="${own.missing}"]`);
-      throw new Error(t("Proxy of {user}: type its address, like http://127.0.0.1:7890", { user: line?.querySelector(".who")?.textContent || own.missing }));
-    }
-    const body = { ...asTyped(), id: p?.id, picked: (p ? chosenIds() : draft.extra || []).slice(0, DETECT_MAX), authHeader: draft.authHeader || "", proxy, accountProxies: own.map };
-    if (!p && pr) {
-      for (const k of ["chat", "responses", "anthropic", "gemini"]) {
-        if (draft[k] === undefined && !body[k]) body[k] = (pr[k] || "").trim();
-      }
-    }
-    if (!p && draft.copyOf) Object.assign(body, { new: true, copyOf: draft.copyOf });
-    return body;
-  };
+  const testDraft = { provider: p, preset: pr, host: ed };
   if (custom) {
     const [stk, scb] = tick(t("Searches the web by itself"), !!draft.searches);
     scb.onchange = () => { draft.searches = scb.checked; };
@@ -10197,40 +10225,9 @@ function drawEditor(p, presetID) {
     advIn.append(...field(t("Images"), itk, t("Off: an agent's images are sent inline on every turn.")));
   }
 
-  let balFix = null, balSlot = null;
-  if (custom) {
-    balSlot = el("div", "bal-slot");
-    balSlot.style.display = "contents";
-    advIn.append(balSlot);
-  }
-  if (p?.balanceToken?.takes || custom) {
-    const saved = !!p?.balanceToken?.set;
-    const tok = input(draft.balanceToken || "", saved && !draft.clearBalanceToken ? t("saved · paste a new one to replace it") : t("optional · the account's system access token"), "password");
-    tok.oninput = () => { draft.balanceToken = tok.value.trim(); };
-    tok.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Escape") cancelEdit(); };
-    const pair = el("div", "pair");
-    pair.append(tok);
-    if (saved && !draft.clearBalanceToken) {
-      const side = el("div", "side");
-      const drop = el("button", "text", t("Remove"));
-      drop.onclick = () => { draft.clearBalanceToken = true; draft.balanceToken = ""; tok.value = ""; tok.placeholder = t("optional · the account's system access token"); drop.remove(); balFix?.refresh(); };
-      side.append(drop);
-      pair.append(side);
-    }
-    const tokHelp = custom
-      ? t("Leave it empty to read the key's own balance: most relays tell it at the Balance URL above (a sub2api relay's …/v1/usage, a new-api relay's …/api/usage/token). Only for the whole account's balance: a new-api relay's System Access Token, or a sub2api panel's login token (a JWT, sent as a Bearer); it is used for nothing else.")
-      : p.balanceURL
-      ? t("What the Balance URL is asked with in place of the key, when it wants the account's own token: a new-api relay's System Access Token, or a sub2api panel's login token (a JWT, sent as a Bearer); it is used for nothing else.")
-      : t("A key tells only what is left on itself. For the whole account's balance on the Usage page, generate a System Access Token in {p}'s settings and paste it here; it is used for nothing else.", { p: pr?.name || p.name });
-    const [label, wrap] = field(t("Account balance"), pair, tokHelp);
-    if (custom) {
-      balFix = balanceFix(p);
-      wrap.append(balFix);
-      // whatever is typed may make it or unmake it, but the User ID keeps its place
-      ed.addEventListener("input", (e) => { if (!e.target.closest?.(".bal-uid")) balFix.refresh(); });
-    }
-    advIn.append(label, wrap);
-  }
+  const balance = p?.balanceToken?.takes || custom ? el("span") : null;
+  if (balance) advIn.append(balance);
+  if (balance || p?.sub2api) window.Sub2API?.mountEditor(ed, p, balance, custom, pr?.name || p?.name);
 
   // a Step Plan's windows are told only to a StepFun sign-in
   if (p?.stepPlan) ed.append(...field(t("Step Plan allowances"), renderStepPlan(p.stepPlan, p.id), t("A key tells only the balance. The Step Plan's 5-hour, weekly and credit windows are told only to a StepFun sign-in: bring yours here once and magpie keeps it (for 30 days), used for nothing else.")));
@@ -10457,50 +10454,6 @@ function drawEditor(p, presetID) {
     const cat = input(draft.catalog, t("models.dev ids, e.g. openai, deepseek"));
     cat.oninput = () => { draft.catalog = cat.value; };
     inner.append(...field(t("Catalog"), cat, t("Display names, reasoning levels and list prices for the models; for a gateway that serves several vendors, list them all, first match wins")));
-    const bal = input(draft.balanceURL, "https://…/api/usage/token", "url");
-    bal.classList.add("bal-url");
-    bal.oninput = () => { draft.balanceURL = bal.value; balPath.placeholder = balanceFieldOf(bal.value); };
-    const method = segs([["", "GET"], ["POST", "POST"]], draft.balanceMethod === "POST" ? "POST" : "", (v) => { draft.balanceMethod = v; });
-    method.classList.add("bal-method");
-    method.setAttribute("role", "group");
-    method.setAttribute("aria-label", t("Balance request method"));
-    method.title = t("How the Balance URL is asked: GET, or POST with no body for a vendor that answers only a POST");
-    const balAsk = el("div", "pair bal-ask");
-    balAsk.append(method, bal);
-    if (p && !draft.balanceURL) import("./balfound.js").then(() => balFound(balAsk, p, draft, bal, () => balPath), () => {});
-    balSlot.append(...field(t("Balance URL"), balAsk, t("Where the vendor tells what is left on the key, asked with it like a chat request; {key} in it or in a header is each key's own, for a vendor that takes the key in the URL (…?key={key}); shown on the Usage page")));
-    const balPath = input(draft.balancePath, balanceFieldOf(draft.balanceURL));
-    balPath.classList.add("bal-path");
-    balPath.oninput = () => { draft.balancePath = balPath.value; };
-    // asked as the form has it, before a Save: what the Usage page would show
-    const balPair = el("div", "pair");
-    balPair.append(balPath);
-    if (p) {
-      const side = el("div", "side");
-      const check = el("button", "text action bal-check", t("Check balance"));
-      check.title = t("Ask the Balance URL now, as the form has it");
-      side.append(check);
-      balPair.append(side);
-      const res = el("div", "bal-res");
-      check.onclick = async () => {
-        check.classList.add("busy");
-        res.className = "bal-res wait"; res.textContent = "…"; res.title = "";
-        const body = { id: p.id, balanceURL: (draft.balanceURL || "").trim(), balancePath: (draft.balancePath || "").trim(), balanceMethod: draft.balanceMethod || "", noBalanceProbe: !!draft.noBalanceProbe, headers: headersOf(draft.headers) };
-        if (draft.balanceToken) body.balanceToken = draft.balanceToken;
-        else if (draft.clearBalanceToken) body.clearBalanceToken = true;
-        try {
-          const r = await api("provider/balance", body);
-          res.className = "bal-res " + (r.error ? "bad" : r.ok ? "ok" : "");
-          res.textContent = r.error ? balanceError(r.error) || r.error : r.ok ? t("Balance") + " " + r.amount : t(r.looked ? "No balance at /v1/usage or /api/usage/token" : "No Balance URL to ask");
-          if (r.looked) window.balFoundShow?.(r);
-          res.title = r.error || "";
-        } catch (e) { res.className = "bal-res bad"; res.textContent = e.message; }
-        check.classList.remove("busy");
-      };
-      balPair.append(res);
-      balPair.classList.add("wrap");
-    }
-    balSlot.append(...field(t("Balance field"), balPair, t("Where the amount is in the reply, e.g. data.balance; it can be a sum with + - * / and brackets, e.g. data.total / 500000 or (1 - credits.used / 70) %; \"$\" in front adds the sign, \"%\" after it shows a percent, with a bar; several, each with a label, go apart by \";\", e.g. 5h: a.used / a.cap %; $credits.left; a list's items are a.*.used, or a[status=active].used for those that match, put in sum(), max(), min() or count(); an amount the reply hasn't shows \"—\" and the others still show")));
     more.append(inner);
     ed.append(more);
   }
@@ -10528,13 +10481,17 @@ function drawEditor(p, presetID) {
   const cancel = el("button", "text ed-cancel", t("Cancel"));
   cancel.onclick = cancelEdit;
   const saveBtn = el("button", "text primary", t(isNew ? "Add" : "Save"));
+  saveBtn.disabled = !!draft.saveRevisionConflict;
   const save = () => {
     if (p && pickingNone()) return editorError(t("Pick a model first."), "warn");
     // a typed icon address first; one that fails stays (hoobnn)
+    const own = draft;
     const waiting = custom && ed.iconFlush?.();
-    if (waiting) return waiting.then((ok) => ok && save());
+    if (waiting) return waiting.then((ok) => ok && draft === own && save());
     // new: an Add never replaces a provider that has the id already
+    if (draft.saveRevisionConflict) return editorError(t("The provider changed; reopen it before saving."), "err");
     const body = { id: p ? slug(draft.id) || p.id : draft.id, from: p?.id, name: draft.name, preset: draft.preset, key: draft.key || "", chat: draft.chat, responses: draft.responses, anthropic: draft.anthropic, gemini: (draft.gemini || "").trim(), catalog: draft.catalog, models: p ? chosenIds() : draft.extra, headers: headersOf(draft.headers), new: isNew };
+    if (p && draft.saveRevision) body.saveRevision = draft.saveRevision;
     if (isNew && draft.copyOf) body.copyOf = draft.copyOf;
     const xb = extraBodyOf(draft.extraBody);
     if (xb.error) { shown(ed.querySelector(".extra-body textarea"))?.focus(NO_SCROLL); return editorError(t("Extra body: {why}", { why: xb.error }), "warn"); }
@@ -10598,7 +10555,7 @@ function drawEditor(p, presetID) {
         shown(line?.querySelector(".proxy-url"))?.focus(NO_SCROLL);
         return editorError(t("Proxy of {user}: type its address, like http://127.0.0.1:7890", { user: line?.querySelector(".who")?.textContent || own.missing }), "warn");
       }
-      body.accountProxies = own.map;
+      if (own.changed) body.accountProxies = own.map;
     }
     body.maxConcurrency = concurrencyOfDraft();
     if (body.maxConcurrency === undefined) return concurrencyError(ed);
@@ -10644,7 +10601,7 @@ function drawEditor(p, presetID) {
     if (picked === false) return pickError();
     saving(saveBtn, t(isNew ? "Adding…" : "Saving…"));
     const okMsg = t(isNew ? "{name} added" : "{name} saved", { name: draft.name || draft.id });
-    saveAccountModelsDraft(picked).then(() => providerAction("save", body, okMsg), (e) => { doneSaving(saveBtn); editorError(e.message || String(e)); });
+    providerAction("save", body, okMsg, "provider/", () => saveAccountModelsDraft(picked));
   };
   saveBtn.onclick = save;
   bar.append(cancel, saveBtn);
@@ -10728,8 +10685,10 @@ function outputField(p, at = el("span")) {
   const ox = input(draft.outputs || "", t("e.g. 32k · or gpt-6=128k, comma separated"));
   ox.classList.add("outputs");
   at.hidden = 1;
-  import("./maximages.js").then(() => at.isConnected && at.replaceWith(...maxImagesField(p)), () => {});
-  return [...field(t("Max output"), sizePicks(ox, "outputs", [8e3, 16e3, 32e3, 64e3, 128e3], null, limitsSaid), t("The most a reply may hold, told to the agents as their max tokens and sent as max_tokens on Anthropic's API when the agent names none; empty leaves it to the vendor and models.dev")), at];
+  const images = window.maxImagesField?.(p);
+  // Redraws keep the loaded field's height while restoring the editor's scroll.
+  if (!images) import("./maximages.js").then(() => at.isConnected && at.replaceWith(...maxImagesField(p)), () => {});
+  return [...field(t("Max output"), sizePicks(ox, "outputs", [8e3, 16e3, 32e3, 64e3, 128e3], null, limitsSaid), t("The most a reply may hold, told to the agents as their max tokens and sent as max_tokens on Anthropic's API when the agent names none; empty leaves it to the vendor and models.dev")), ...(images || [at])];
 }
 
 // nativeCompactionField: Codex's own compaction on the provider (#1099),
@@ -10750,53 +10709,10 @@ function nativeCompactionField(show, probe) {
 }
 
 function nativeTestField(control, kind, form) {
-  const words = kind === "search" ? {
-    check: "Check search",
-    title: "Send native web search requests with the form as typed. Uses the provider's quota; nothing is saved.",
-    ok: "Native search confirmed",
-    failed: "Search request failed",
-    unknown: "Not confirmed: no native search result returned",
-    note: "Only the tested model and key are checked. Tick the option yourself to use native search.",
-  } : {
-    check: "Check compaction",
-    title: "Send a native compaction request with the form as typed. Uses the provider's quota; nothing is saved.",
-    ok: "Native compaction confirmed",
-    failed: "Compaction request failed",
-    unknown: "Not confirmed: no encrypted compaction returned",
-    note: "Only the tested model and key are checked. Tick the option yourself to use native compaction.",
-  };
   const wrap = el("div", "detect native-test " + kind + "-test");
-  const controls = el("div", "detect-row");
-  const test = el("button", "text action", t(words.check));
-  test.type = "button";
-  test.title = t(words.title);
-  controls.append(control, test);
-  const out = el("div", "native-test-out");
-  out.hidden = true;
-  out.setAttribute("role", "status");
-  out.setAttribute("aria-live", "polite");
-  wrap.append(controls, out);
-  test.onclick = async () => {
-    if (test.disabled) return;
-    const xb = extraBodyOf(draft.extraBody);
-    if (xb.error) { out.hidden = false; out.replaceChildren(el("div", "hint err", xb.error)); return; }
-    test.disabled = true;
-    test.classList.add("busy");
-    out.hidden = false;
-    out.replaceChildren(el("div", "hint", t("Checking…")));
-    try {
-      const r = await api("provider/test-" + kind, form());
-      out.replaceChildren();
-      for (const x of r.results) {
-        const result = el("div", "hint " + (x.ok ? "ok" : x.error ? "err" : "warn"));
-        const label = apiLabel(x.protocol) + (x.model ? " · " + x.model : "");
-        result.textContent = label + " · " + (x.ok ? t(words.ok) : x.error ? t(words.failed) + ": " + (x.status ? x.status + " · " : "") + t(x.error) : t(words.unknown));
-        out.append(result);
-      }
-      out.append(el("div", "hint", t(words.note)));
-    } catch (e) { out.replaceChildren(el("div", "hint err", e.message)); }
-    finally { test.disabled = false; test.classList.remove("busy"); }
-  };
+  wrap.append(control);
+  import("./provider-tests.js").then((m) => m.mountNativeTest(wrap, control, kind, form))
+    .catch((e) => wrap.append(el("div", "hint err", e.message)));
   return wrap;
 }
 
@@ -11741,7 +11657,11 @@ function renderModels(p) {
     const measure = () => {
       if (!chips.isConnected) return;
       const most = Math.min(MCHIPS_MAX, innerHeight * 0.4);
-      fold.hidden = !(foldNeeded[p.id] = chips.scrollHeight > (modelsOpen ? most : chips.clientHeight) + 1);
+      const hidden = !(foldNeeded[p.id] = chips.scrollHeight > (modelsOpen ? most : chips.clientHeight) + 1);
+      if (fold.hidden === hidden) return;
+      const scrolling = fold.closest(".ebody"), top = scrolling?.scrollTop;
+      fold.hidden = hidden;
+      if (scrolling) scrolling.scrollTop = top;
     };
     // measured once on the page, till then as last (indexyz)
     fold.hidden = !foldNeeded[p.id];
@@ -14412,72 +14332,6 @@ function balanceError(err) {
   return "";
 }
 
-// An account token needs a Balance URL; /api/usage/token and sub2api's
-// /v1/usage take API keys only. Other URLs are left alone.
-function balanceFix(p) {
-  const box = el("div", "bal-fix");
-  const origin = (u) => { try { const x = new URL(u); return /^https?:$/.test(x.protocol) ? x.origin : ""; } catch { return ""; } };
-  box.refresh = () => {
-    box.replaceChildren();
-    box.className = "bal-fix";
-    const tok = !!draft.balanceToken || (!!p?.balanceToken?.set && !draft.clearBalanceToken);
-    if (!tok) return;
-    const u = (draft.balanceURL || "").trim();
-    let path = "";
-    try { path = new URL(u).pathname.replace(/\/+$/, ""); } catch {}
-    let why = "";
-    if (path === "/api/usage/token") why = t("…/api/usage/token takes the API key, not this token: for the account's balance, new-api uses /api/user/self; sub2api uses /api/v1/user/profile.");
-    else if (path === "/v1/usage") why = t("…/v1/usage takes the API key, not this token: for the account's balance, a sub2api panel uses /api/v1/user/profile.");
-    else if (!u) why = t("The token needs a Balance URL: a new-api relay uses /api/user/self; a sub2api panel uses /api/v1/user/profile to read the account's balance.");
-    if (why) {
-      box.classList.add("warn");
-      box.append(el("span", "", why));
-      const site = origin(u) || origin(draft.chat || draft.anthropic || draft.responses || "");
-      if (!site) return;
-      // sub2api's /v1/usage has one account query beside it: its panel's
-      for (const to of (path === "/v1/usage" ? ["/api/v1/user/profile"] : ["/api/user/self", "/api/v1/user/profile"]).map((q) => site + q)) {
-        const use = el("button", "text action", t("Use {url}", { url: to }));
-        use.onclick = () => {
-          draft.balanceURL = to;
-          // An unrelated expression belongs to the user, so changing the
-          // endpoint must not overwrite it.
-          if (!(draft.balancePath || "").trim() || /total_(available|granted|used)|unlimited_quota|^\s*\$?remaining\s*$/.test(draft.balancePath)) draft.balancePath = balanceFieldOf(to);
-          const ed = box.closest(".editor");
-          const bal = ed?.querySelector(".bal-url");
-          const field = ed?.querySelector(".bal-path");
-          if (bal) bal.value = draft.balanceURL;
-          if (field) { field.value = draft.balancePath; field.placeholder = balanceFieldOf(draft.balanceURL); }
-          // the Balance URL's own fold, not the first one in the editor
-          if (bal) shown(bal);
-          box.refresh();
-        };
-        box.append(use);
-      }
-      return;
-    }
-    // new-api wants the user's id in New-Api-User (zxc56823)
-    if (path === "/api/user/self") {
-      draft.headers = draft.headers || [];
-      const have = newAPIUserOf(draft.headers);
-      const row = el("label", "bal-uid");
-      const uid = input(have, t("in the site's personal settings"));
-      uid.inputMode = "numeric";
-      const bad = () => uid.classList.toggle("bad", !!uid.value.trim() && !/^\d+$/.test(uid.value.trim()));
-      bad();
-      uid.oninput = () => {
-        setNewAPIUser(draft.headers, uid.value.trim());
-        bad();
-        box.closest(".editor")?.querySelector(".headers")?.render?.();
-      };
-      row.append(el("span", "bal-uid-name", t("User ID")), uid);
-      box.append(row);
-      if (!have) box.append(el("span", "bal-uid-why", t("A new-api relay also asks for your user ID with the token. It is in the site's personal settings.")));
-    }
-  };
-  box.refresh();
-  return box;
-}
-
 // accountRefresh: an account row's refresh, then its rows read again
 function accountRefresh(agent, p, user) {
   const b = quotaRefresh({ provider: p?.id || agent, user }, async () => {
@@ -15174,8 +15028,9 @@ function accountModelsDraft(p) {
 }
 async function saveAccountModelsDraft(body) {
   if (!body) return;
+  const a = acctModels, chosen = a?.chosen;
   await api("provider/accountmodels", body);
-  acctModels = null;
+  if (acctModels === a && a?.chosen === chosen) acctModels = null;
 }
 // It gives the pill, and the open picker the row ends with, or null.
 function accountModels(p, ref, isKey, name) {
@@ -15994,18 +15849,25 @@ function renderMove(p) {
   return field(t("Runs on"), box, onPlugin ? t("magpie's built-in is retired, so this subscription stays on its plugin.") : t("If an account doesn't work through the plugin, nothing changes."));
 }
 
-async function providerAction(action, body, okMsg, base = "provider/") {
+async function providerAction(action, body, okMsg, base = "provider/", before) {
+  const was = editing, previous = draft;
+  const ownsEditor = () => editing === was && draft === previous;
   if (action === "delete" && !await confirmRemoval(providers?.providers.find((p) => p.id === body.id)?.name || body.id,
     "Its saved configuration will be removed. Agents using it may switch to another provider or their default model.")) return false;
   try {
-    const was = editing;
+    if (before) await before();
     providers = await api(base + action, body);
-    dropSigningIn(was); // saved or removed, the editor takes its sign-in with it
-    editing = null;
-    draft = null;
-    importing = null;
-    adding = false;
-    presetQuery = "";
+    if (ownsEditor()) {
+      dropSigningIn(was);
+      await window.Sub2API?.cancelEditor(was);
+      if (ownsEditor()) {
+        editing = null;
+        draft = null;
+        importing = null;
+        adding = false;
+        presetQuery = "";
+      }
+    }
     renderProviders();
     state = await api("state");
     renderAgents();
@@ -16014,21 +15876,33 @@ async function providerAction(action, body, okMsg, base = "provider/") {
     saidMoved(providers.placed ? t("Saved at {region}: the key is that region's", { region: t(providers.placed) }) : okMsg);
     return true;
   } catch (e) {
-    // a Remove may have gone through before what failed: the list as it is
-    // now, and the editor of a provider gone closes, rather than stay open
-    // on it for a second Remove to say there is no such provider
-    if (action === "delete" && typeof editing === "string") {
+    if (action === "save" && e.status === 409) {
+      // Never replay a stale draft.
+      if (ownsEditor() && draft) draft.saveRevisionConflict = true;
+      try { providers = await api("providers"); } catch { /* the conflict stays visible below */ }
+      renderProviders();
+      if (ownsEditor()) {
+        editorError(e.message, "err");
+        for (const b of document.querySelectorAll(".editor .busy")) doneSaving(b);
+      } else statusErr(e);
+      return false;
+    }
+    // A failed Remove rereads state so an already removed provider's editor closes.
+    if (action === "delete" && typeof was === "string") {
       try {
         providers = await api("providers");
-        if (!providers.providers.some((p) => p.id === editing)) {
-          editing = null; draft = null;
+        if (!providers.providers.some((p) => p.id === was)) {
+          if (ownsEditor()) {
+            await window.Sub2API?.cancelEditor(was);
+            if (ownsEditor()) { editing = null; draft = null; }
+          }
           renderProviders();
           return statusErr(e);
         }
       } catch { /* the error below says enough */ }
     }
-    if (!editorError(e.message, "err")) statusErr(e);
-    for (const b of document.querySelectorAll(".editor .busy")) doneSaving(b);
+    if (!ownsEditor() || !editorError(e.message, "err")) statusErr(e);
+    if (ownsEditor()) for (const b of document.querySelectorAll(".editor .busy")) doneSaving(b);
   }
 }
 

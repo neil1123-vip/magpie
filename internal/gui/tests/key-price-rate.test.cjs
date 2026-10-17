@@ -142,5 +142,16 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert(!Object.hasOwn(saved.body, "keyPriceRates"), "the server keeps what it had");
       assert.deepEqual(errors, []);
     });
+
+    test(`${engine} ${lang}: saving other settings leaves current key rates to the server`, async (t) => {
+      const { page, errors, posts } = await open(t, "Relay");
+      await unfold(page);
+      assert.equal(await rate(page, "bbbbbbbbbb").inputValue(), "1.2");
+      await page.locator(".editor input.price-rate").fill("0.9");
+      const saved = await save(page, posts);
+      assert.equal(saved.body.priceRate, 0.9);
+      assert(!Object.hasOwn(saved.body, "keyPriceRates"), "untouched rates must not replace a newer background reading");
+      assert.deepEqual(errors, []);
+    });
   }
 }

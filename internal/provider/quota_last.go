@@ -103,7 +103,7 @@ func keepLast(q SubscriptionQuota, user string) SubscriptionQuota {
 		return q
 	}
 	claudeUnavailable := q.Provider == "claude" && claudeUsageUnknown.MatchString(q.Error)
-	if !claudeUnavailable && !passing.MatchString(q.Error) {
+	if q.Sub2API == "" && !claudeUnavailable && !passing.MatchString(q.Error) {
 		return q
 	}
 	read := c.reading
@@ -117,6 +117,9 @@ func keepLast(q SubscriptionQuota, user string) SubscriptionQuota {
 	out.ReadDeferred = readDeferred(q.Error)
 	if !out.ReadDeferred {
 		out.ReadError = q.Error
+	}
+	if q.Sub2API != "" {
+		out.Error, out.Sub2API = q.Error, q.Sub2API
 	}
 	out.Name, out.Icon, out.User = q.Name, q.Icon, q.User
 	if out.Name == "" {

@@ -112,13 +112,15 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       let saved = await save(page, posts);
       assert.equal(saved.action, "save");
       assert.equal(saved.body.topUpRate, 0.0714);
-      assert.deepEqual(saved.body.keyPriceRates, { cccccccccc: 0.3 });
+      assert.equal(Object.hasOwn(saved.body, "keyPriceRates"), false, "changing the top-up rate leaves saved key rates alone");
 
       await page.locator(".row.provider", { hasText: "Relay" }).click();
       await box(page).waitFor();
       await box(page).fill("");
+      await rate(page, "cccccccccc").fill("0.4");
       saved = await save(page, posts);
       assert.equal(saved.body.topUpRate, null, "emptied, it is taken off");
+      assert.deepEqual(saved.body.keyPriceRates, { cccccccccc: 0.4 }, "an explicit key rate edit is saved with the top-up change");
       assert.deepEqual(errors, []);
     });
 

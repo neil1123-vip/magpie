@@ -563,7 +563,8 @@ var ownPrice catalog.Price
 
 // Pricer uses the same effective price as the model CLI and session totals:
 // explicit provider/model or provider-wide prices (including zero), then the
-// provider catalog, then the maker catalog. Settings are read once per query.
+// provider catalog, then the maker catalog, at the actual key's local rate
+// when known. Settings are read once per query.
 //
 // A model no price is known for is priced as the model the vendor's reply
 // said answered (Served), at the same provider, when that one has a price:

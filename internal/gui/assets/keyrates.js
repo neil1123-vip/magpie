@@ -53,7 +53,7 @@ function keyPriceRateLine(it) {
   box.classList.add("key-price-rate");
   box.inputMode = "decimal";
   box.setAttribute("aria-label", t("Price rate of {user}", { user: it.name }));
-  box.oninput = () => { draft.keyPriceRates[it.k] = box.value; };
+  box.oninput = () => { draft.keyPriceRates[it.k] = box.value; draft.keyPriceRatesChanged = true; };
   line.append(who, box);
   return line;
 }
@@ -76,14 +76,13 @@ document.addEventListener("input", (e) => {
   }
 });
 // keyPriceRates is each key's own price rate as saved, the keys left
-// empty out; a key typed wrong is focused and named, and gives null. An
-// editor that drew no lines sends them as they were (undefined). It puts
-// the top-up rate in body too, when the editor drew its box, and gives
-// null when that is typed wrong.
+// empty out. It validates the top-up rate even when key rates were left
+// untouched. Only edited key rates are sent, so background updates survive.
+// An invalid field is focused and named, and gives null.
 window.keyPriceRates = function (ed, body) {
   const top = ed.querySelector("input.top-up-rate");
   if (top && (body.topUpRate = topUpRateOf(top)) === undefined) return null;
-  if (!ed.querySelector(".key-rates")) return undefined;
+  if (!draft.keyPriceRatesChanged || !ed.querySelector(".key-rates")) return;
   const map = {};
   for (const [k, v] of Object.entries(draft.keyPriceRates || {})) {
     const s = String(v ?? "").trim();

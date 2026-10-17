@@ -11,3 +11,4 @@
 /.overlay/
 /internal/conptypair/amd64/
 /internal/conptypair/arm64/
+/.tmp-sub2api-wails/

@@ -10,6 +10,8 @@ package provider
 import (
 	"bytes"
 	"cmp"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +28,7 @@ import (
 
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/filelock"
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/lazyre"
@@ -307,7 +310,6 @@ type Provider struct {
 	// PriceRate; outside every window the price rate alone counts. At
 	// most RateWindowsMax of them (CheckRateWindows).
 	RateWindows []RateWindow `json:"rateWindows,omitempty"`
-
 	// Headers are extra HTTP request headers sent to the vendor, as the user
 	// typed them but for ${sessionId} and ${threadId} in a value, the
 	// request's conversation ids (SentHeaders, conversation.go). They ride on every request magpie makes to a plain
@@ -630,6 +632,9 @@ type Provider struct {
 	// NoBalanceProbe turns off the look for a balance query on a relay
 	// added with no Balance URL (balance_probe.go).
 	NoBalanceProbe bool `json:"noBalanceProbe,omitempty"`
+	// Sub2API refers to a local panel session; no panel credentials ride
+	// in the portable provider configuration.
+	Sub2API *Sub2APIBinding `json:"sub2api,omitempty"`
 	// BalanceToken is what a vendor tells the whole account's balance to,
 	// where a key is told only what is left on itself: AiHubMix's system
 	// access token, or a new-api relay's for its /api/user/self named in
@@ -773,9 +778,12 @@ type Provider struct {
 	// keyView is set on p.WithKey(k): p as that one key is asked with,
 	// at its plan, whose keys no longer tell plans apart (plansMixed)
 	keyView bool
+	// SaveRevision identifies the stored fields the editor opened.
+	SaveRevision string `json:"-"`
 }
 
 type file struct {
+	baseline  configBaseline
 	Providers []Provider `json:"providers"`
 	Groups    []Group    `json:"groups,omitempty"`
 	// Searches are the web search APIs a model's search goes to when no
@@ -804,6 +812,12 @@ type file struct {
 	// Deleted are the providers the user deleted, so the calls made to
 	// one stay its own when another is added under its id (Renames).
 	Deleted []Deleted `json:"deleted,omitempty"`
+}
+
+type configBaseline struct {
+	path   string
+	exists bool
+	hash   [sha256.Size]byte
 }
 
 // Path is the file the user's providers live in.
@@ -844,6 +858,9 @@ func parseProviders(b []byte) (file, error) {
 // decoded: never an empty catalog, to list as none, back up or write over.
 var ErrUnreadable = errors.New("providers.json can't be read")
 
+// ErrConfigConflict refuses a stale whole-file write or an old editor.
+var ErrConfigConflict = errors.New("the provider configuration changed; reopen it before saving")
+
 type unreadableError struct {
 	path string
 	err  error
@@ -864,8 +881,10 @@ var fileReads atomic.Int64
 func read() (file, error) {
 	fileReads.Add(1)
 	var f file
-	b, err := steady.ReadFile(Path())
+	path := Path()
+	b, err := steady.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
+		f.baseline = configBaseline{path: path}
 		return f, nil
 	}
 	if err != nil {
@@ -874,6 +893,7 @@ func read() (file, error) {
 	// An editor that saves with a byte-order mark leaves JSON that Go's
 	// decoder refuses; read as broken, the file fell back to its .bak, an
 	// older generation without what was saved since (#1821).
+	baseline := configBaseline{path: path, exists: true, hash: sha256.Sum256(b)}
 	b = bytes.TrimPrefix(b, utf8BOM)
 	if err := json.Unmarshal(b, &f); err != nil {
 		// one left all zero by a crash (#1505) is its last good generation
@@ -886,6 +906,7 @@ func read() (file, error) {
 			return file{}, &unreadableError{Path(), err}
 		}
 	}
+	f.baseline = baseline
 	return f, nil
 }
 
@@ -936,8 +957,24 @@ func Routings() ([]string, error) {
 // file cut short.
 func store(f file) error {
 	p := Path()
+	if f.baseline.path != p {
+		return ErrConfigConflict
+	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
+	}
+	unlock, held := filelock.Lock(p+".lock", filelock.Wait)
+	defer unlock()
+	if !held {
+		return errors.New("could not lock providers.json; the configuration was left unchanged")
+	}
+	current, err := steady.ReadFile(p)
+	exists := err == nil
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return &unreadableError{p, err}
+	}
+	if exists != f.baseline.exists || exists && sha256.Sum256(current) != f.baseline.hash {
+		return ErrConfigConflict
 	}
 	// a group as it was read has the models its patterns matched then
 	// among its members: they are found again each time, never written
@@ -1006,6 +1043,7 @@ func sharedAll() []Provider {
 
 // clone is p with its settings unshared: slices, maps and pointers copied.
 func (p Provider) clone() Provider {
+	p.Sub2API = cloneSub2APIBinding(p.Sub2API)
 	p.Was = slices.Clone(p.Was)
 	p.Gave = slices.Clone(p.Gave)
 	p.Keys = slices.Clone(p.Keys)
@@ -1019,11 +1057,11 @@ func (p Provider) clone() Provider {
 	p.ReplyHeaders = slices.Clone(p.ReplyHeaders)
 	p.PassHeaders = slices.Clone(p.PassHeaders)
 	p.AccountProxies = maps.Clone(p.AccountProxies)
+	p.KeyPriceRates = maps.Clone(p.KeyPriceRates)
 	p.AccountCaps = maps.Clone(p.AccountCaps)
 	p.AccountNames = maps.Clone(p.AccountNames)
 	p.KeySpendCaps = maps.Clone(p.KeySpendCaps)
 	p.KeyOwnBalances = maps.Clone(p.KeyOwnBalances)
-	p.KeyPriceRates = maps.Clone(p.KeyPriceRates)
 	if p.AccountWindowCaps != nil {
 		m := make(map[string]map[string]int, len(p.AccountWindowCaps))
 		for k, v := range p.AccountWindowCaps {
@@ -1103,6 +1141,7 @@ func allProviders() []Provider {
 func ownOf(f file) (own []Provider, picks map[string]Provider) {
 	picks = map[string]Provider{}
 	for _, p := range f.Providers {
+		p.SaveRevision = saveRevision(p, true)
 		p = normalize(p)
 		if !hasEndpoint(p) {
 			picks[p.ID] = p
@@ -1133,6 +1172,10 @@ func withPicks(a, pk Provider) Provider {
 // written but never read back.
 func accountSettings(a, pk Provider) Provider {
 	a.PickedFrom, a.Delisted, a.DelistedAt = pk.PickedFrom, pk.Delisted, pk.DelistedAt
+	a.SaveRevision = pk.SaveRevision
+	if a.SaveRevision == "" {
+		a.SaveRevision = saveRevision(Provider{}, false)
+	}
 	a.Models, a.Unlisted, a.Off, a.Fallback, a.Routing, a.Affinity, a.KeepLogin, a.KeepLoginAs, a.Contexts, a.Family = pk.Models, pk.Unlisted, pk.Off, pk.Fallback, pk.Routing, pk.Affinity, pk.KeepLogin, pk.KeepLoginAs, pk.Contexts, pk.Family
 	a.SwitchOnly, a.RestartApp = pk.SwitchOnly, pk.RestartApp
 	a.Sink, a.NoModels, a.BestInFamily = pk.Sink, pk.NoModels, pk.BestInFamily
@@ -1277,6 +1320,87 @@ func Slug(name string) string {
 
 // Save adds or replaces a provider.
 func Save(p Provider) error {
+	return save(p, "", false)
+}
+
+// SaveWithRevision also checks the stored fields the editor can replace.
+func SaveWithRevision(p Provider, expected string) error {
+	return save(p, expected, true)
+}
+
+func saveRevision(p Provider, exists bool) string {
+	if !exists {
+		return "absent:v1"
+	}
+	full := revisionHash(p)
+	key := revisionHash(p.Key)
+	var refs []string
+	for _, k := range p.KeyList() {
+		refs = append(refs, k.ID)
+	}
+	slices.Sort(refs)
+	proxies := revisionHash(struct {
+		Proxies map[string]string
+		Keys    []string
+	}{p.AccountProxies, refs})
+	p.setFirst(KeyAccount{})
+	p.AccountProxies = nil
+	keepIndependentSettings(&p, Provider{})
+	form := revisionHash(p)
+	if full == "" || key == "" || proxies == "" || form == "" {
+		return ""
+	}
+	return "v2:" + form + ":" + key + ":" + proxies + ":" + full
+}
+
+func revisionHash(value any) string {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	hash := sha256.Sum256(b)
+	return hex.EncodeToString(hash[:])
+}
+
+func editorRevisionMatches(p Provider, exists bool, expected string, key, proxies, rates bool) bool {
+	current := saveRevision(p, exists)
+	if expected == "" || current == "" {
+		return false
+	}
+	if expected == current {
+		return true
+	}
+	if rates {
+		return false
+	}
+	want, got := strings.Split(current, ":"), strings.Split(expected, ":")
+	return len(want) == 5 && len(got) == 5 && got[0] == "v2" && got[1] == want[1] &&
+		(!key || got[2] == want[2]) && (!proxies || got[3] == want[3])
+}
+
+// These settings have their own writes; the main form never replaces them.
+func keepIndependentSettings(p *Provider, was Provider) {
+	p.Keys, p.AccountModels = was.Keys, was.AccountModels
+	p.AccountModelsAll = was.AccountModelsAll
+	p.AccountCaps, p.AccountWindowCaps = was.AccountCaps, was.AccountWindowCaps
+	p.AccountConcurrency, p.AccountWeights, p.AccountNames = was.AccountConcurrency, was.AccountWeights, was.AccountNames
+	p.KeySpendCaps = was.KeySpendCaps
+	p.KeyOwnBalances = was.KeyOwnBalances
+	p.KeepLogin, p.KeepLoginAs, p.SwitchOnly = was.KeepLogin, was.KeepLoginAs, was.SwitchOnly
+	p.RestartApp = was.RestartApp
+	p.KeepSelf = was.KeepSelf
+	p.UseFirst = was.UseFirst
+	p.CapStop, p.CapCareful, p.Off = was.CapStop, was.CapCareful, was.Off
+	p.RefreshEvery, p.AutoInclude = was.RefreshEvery, was.AutoInclude
+	p.Sub2API, p.KeyPriceRates = was.Sub2API, was.KeyPriceRates
+	p.PickedFrom, p.Delisted, p.DelistedAt = was.PickedFrom, was.Delisted, was.DelistedAt
+}
+
+func save(p Provider, expected string, checkRevision bool) error {
+	snapshot := p.SaveRevision
+	keyGiven, proxiesGiven := strings.TrimSpace(p.Key) != "", p.AccountProxies != nil
+	ratesGiven := p.KeyPriceRates != nil
+	rates := normalKeyPriceRates(p.KeyPriceRates)
 	// a key given a Vertex AI provider is refused here, before normalize
 	// drops it: it would never be sent
 	if p.IsVertex() && len(p.Keys) > 0 {
@@ -1287,6 +1411,9 @@ func Save(p Provider) error {
 		return errors.New("a base URL is for an API key: Google credentials are sent only to Google's own address")
 	}
 	p = normalize(p)
+	if ratesGiven {
+		p.KeyPriceRates = rates
+	}
 	p.IconURL = "" // import-only: never stored
 	// where a picture came from goes only with that picture
 	if p.IconFrom = strings.TrimSpace(p.IconFrom); !strings.HasPrefix(p.Icon, iconPrefix) {
@@ -1320,7 +1447,9 @@ func Save(p Provider) error {
 	if p.Name == "" {
 		p.Name = p.ID
 	}
-	if _, ok := find(Accounts(), p.ID); ok || p.ID == "kiro" && (p.Key != "" || stored(p.ID)) {
+	_, account := find(Accounts(), p.ID)
+	account = account || p.ID == "kiro" && (p.Key != "" || stored(p.ID))
+	if account {
 		// an account keeps only the user's model picks; the rest is the
 		// agent's own sign-in. One the user removed stays removed: only
 		// ShowAccount brings it back. Kiro's alone also keeps a key, which
@@ -1332,7 +1461,6 @@ func Save(p Provider) error {
 		}
 		p = accountSettings(Provider{ID: p.ID, Key: key, Hidden: hiddenAccount(p.ID), Quiet: quietAccount(p.ID), Tucked: tuckedAccount(p.ID)}, p)
 	} else {
-		p.AccountProxies = keyProxies(p) // a provider of keys proxies each key apart
 		if subscriptionID(p.ID) && !stored(p.ID) {
 			// taken, it would hide that subscription once signed in
 			return fmt.Errorf("%q is the id of the %s subscription; pick another name", p.ID, p.ID)
@@ -1389,10 +1517,12 @@ func Save(p Provider) error {
 		if strings.Contains(p.Decide, WorkspaceID) {
 			return errors.New("Bailian's decision model is asked at your workspace's host: give its workspace ID (workspace=… or the editor's Workspace ID), or pick the Token Plan")
 		}
-		if p.Key == "" && !keyOptional(p) && !p.IsVertex() {
+		if !checkRevision && p.Key == "" && !keyOptional(p) && !p.IsVertex() {
 			return fmt.Errorf("%s needs an API key", p.Name)
 		}
 	}
+	sub2apiEdits.Lock()
+	defer sub2apiEdits.Unlock()
 	f, err := read()
 	if err != nil {
 		return err
@@ -1402,10 +1532,63 @@ func Save(p Provider) error {
 	if i >= 0 {
 		was = &f.Providers[i]
 	}
+	if !checkRevision && snapshot != "" {
+		current := Provider{}
+		if was != nil {
+			current = *was
+		}
+		if snapshot != saveRevision(current, was != nil) {
+			return ErrConfigConflict
+		}
+	}
+	if checkRevision && (was != nil || expected != "") {
+		current := Provider{}
+		if was != nil {
+			current = *was
+		}
+		if !editorRevisionMatches(current, was != nil, expected, keyGiven, proxiesGiven, ratesGiven) {
+			return ErrConfigConflict
+		}
+	}
+	if checkRevision && was != nil {
+		rates := p.KeyPriceRates
+		keepIndependentSettings(&p, *was)
+		if ratesGiven {
+			p.KeyPriceRates = rates
+		}
+		if !keyGiven || p.Key == strings.TrimSpace(was.Key) {
+			latest := normalize(*was)
+			p.setFirst(latest.first())
+		}
+		if !proxiesGiven {
+			p.AccountProxies = was.AccountProxies
+		}
+	}
+	if !account {
+		if p.Key == "" && !keyOptional(p) && !p.IsVertex() {
+			return fmt.Errorf("%s needs an API key", p.Name)
+		}
+		p.AccountProxies = keyProxies(p)
+	}
 	p.PickedFrom = listedWith(p, was)
 	p.Delisted = delistedWith(p, was)
 	p.DelistedAt = delistedAtWith(p, was)
 	if was != nil {
+		// Session bindings change through their dedicated operation; an
+		// editor opened before login must not erase or restore one.
+		p.Sub2API = cloneSub2APIBinding(was.Sub2API)
+		if !ratesGiven {
+			p.KeyPriceRates = sub2apiKeyPriceRates(*was)
+		}
+		if p.Sub2API != nil {
+			for i := range p.Sub2API.Keys {
+				p.Sub2API.Keys[i].PriceRate = 0
+			}
+		}
+		p.KeyPriceRates = sub2apiKeyPriceRates(p)
+		if err := keepSub2APIBinding(&p); err != nil {
+			return err
+		}
 		if p.Was == nil {
 			p.Was = was.Was
 		}
@@ -1424,6 +1607,8 @@ func Save(p Provider) error {
 		// a new provider under an id another had: what was recorded under
 		// it until now stays that one's
 		giveID(f.Providers, -1, p.ID, time.Now())
+		p.KeyPriceRates = sub2apiKeyPriceRates(p)
+		p.Sub2API = importedSub2APIBinding(p)
 		f.Providers = append(f.Providers, p)
 	}
 	if err := store(f); err != nil {
@@ -1552,6 +1737,7 @@ func add(p Provider, once bool) (string, error) {
 		}
 	}
 	p.ID, p.Name = freeID(p.ID), freeName(p.Name)
+	p.SaveRevision = saveRevision(Provider{}, false)
 	if err := Save(p); err != nil {
 		return p.ID, err
 	}
@@ -1594,6 +1780,18 @@ func AddCopy(p Provider, from string) (string, error) {
 	}
 	if p.BalanceToken == "" {
 		p.BalanceToken = src.BalanceToken
+	}
+	if p.Sub2API == nil {
+		p.Sub2API = cloneSub2APIBinding(src.Sub2API)
+	}
+	if p.KeyPriceRates == nil {
+		p.KeyPriceRates = sub2apiKeyPriceRates(*src)
+	}
+	if err := keepSub2APIBinding(&p); err != nil {
+		return "", err
+	}
+	if p.Sub2API != nil {
+		p.Sub2API = importedSub2APIBinding(p)
 	}
 	// the access key as the copy's editor showed it: the form sends its ID
 	// but never the saved Secret, which went missing from the copy (#1821)
@@ -1899,6 +2097,13 @@ func normalize(p Provider) Provider {
 	p.KeyPriceRates = normalKeyPriceRates(p.KeyPriceRates)
 	if TopUpRateOK(p.TopUpRate) != "" {
 		p.TopUpRate = 0
+	}
+	p.KeyPriceRates = sub2apiKeyPriceRates(p)
+	if p.Sub2API != nil {
+		p.Sub2API = cloneSub2APIBinding(p.Sub2API)
+		for i := range p.Sub2API.Keys {
+			p.Sub2API.Keys[i].PriceRate = 0
+		}
 	}
 	if len(p.Models) > 0 {
 		p.NoModels = false // a pick is no longer Select none

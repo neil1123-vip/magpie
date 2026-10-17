@@ -75,9 +75,10 @@ func TestFetchModelsTicksEveryKeysModels(t *testing.T) {
 
 	// the user sets sk-c to All models and un-ticks m2 for sk-b, then saves
 	// the editor; neither is undone by the save or a Fetch
+	form := currentProviderForm(t, `{"id":"relay","from":"relay","name":"Relay","chat":"`+srv.URL+`/v1","key":""}`)
 	post("/api/provider/accountmodels", `{"id":"relay","account":"`+provider.KeyID("sk-c")+`","allow":[]}`)
 	post("/api/provider/accountmodels", `{"id":"relay","account":"`+provider.KeyID("sk-b")+`","allow":["m1"]}`)
-	post("/api/provider/save", `{"id":"relay","from":"relay","name":"Relay","chat":"`+srv.URL+`/v1","key":""}`)
+	post("/api/provider/save", form)
 	post("/api/provider/models", `{"id":"relay","typed":true}`)
 	if got := models("sk-c"); got != nil {
 		t.Errorf("sk-c set to All models, then saved and fetched: %v", got)

@@ -31,7 +31,7 @@ func TestProviderSaveKeyPriceRates(t *testing.T) {
 		t.Helper()
 		w := httptest.NewRecorder()
 		body := `{"id":"relay","from":"relay","name":"Relay","key":"","chat":"http://127.0.0.1:1/v1","icon":"generic","models":[],"headers":{}` + extra + `}`
-		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(body)))
+		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(currentProviderForm(t, body))))
 		return w.Code
 	}
 	listed := func() map[string]float64 {

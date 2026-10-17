@@ -26,6 +26,7 @@ func TestProviderSaveKeepsVolcengineSecret(t *testing.T) {
 	providerRoutes(mux, nil)
 	post := func(body string) {
 		t.Helper()
+		body = currentProviderForm(t, body)
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(body)))
 		if w.Code != 200 {

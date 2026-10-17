@@ -289,7 +289,10 @@ type providerJSON struct {
 	BalancePath   string `json:"balancePath,omitempty"`
 	BalanceMethod string `json:"balanceMethod,omitempty"`
 	// NoBalanceProbe: the look for a balance query is turned off
-	NoBalanceProbe bool `json:"noBalanceProbe,omitempty"`
+	NoBalanceProbe  bool                     `json:"noBalanceProbe,omitempty"`
+	Sub2API         *provider.Sub2APIBinding `json:"sub2api,omitempty"`
+	Sub2APIRevision string                   `json:"sub2apiRevision,omitempty"`
+	SaveRevision    string                   `json:"saveRevision"`
 	// the query magpie found by itself for a relay added by hand with no
 	// Balance URL, and its field (provider.BalanceFound)
 	BalanceFound      string `json:"balanceFound,omitempty"`
@@ -1023,6 +1026,7 @@ func providerInfoWith(p provider.Provider, ls provider.Listing, agents []agentUs
 		Catalog: p.Catalog, Website: p.Website, KeysURL: p.KeysURL,
 		Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountWindowAmounts: p.AccountWindowAmounts, AccountNames: p.AccountNames, Headers: p.Headers, ExtraBody: p.ExtraBody, ReplyHeaders: p.ReplyHeaders, PassHeaders: p.PassHeaders, Searches: p.Searches, Cline: p.ClinePinnable(), PinUpstream: p.PinUpstream, Unredacted: p.Unredacted, CountFree: p.CountFree, Billing: p.Billing, BillingKind: p.BillingKind(), InsecureTLS: p.InsecureTLS, TakesInsecureTLS: p.TakesInsecureTLS(), HTTP1: p.HTTP1, ClientCert: tilde(p.ClientCert), ClientKey: tilde(p.ClientKey), ServerCA: tilde(p.ServerCA), TakesClientCert: p.TakesClientCert(), ServerPin: p.ServerPin, TakesServerPin: p.TakesServerPin(), Resolve: p.Resolve, TakesResolve: p.TakesResolve(), Socket: p.Socket, TakesSocket: p.TakesSocket(), LimitRestOff: p.LimitRestOff, UpstreamProviders: p.UpstreamProviders, ImageFilesOff: p.ImageFilesOff, TakesImageFiles: p.TakesImageFiles(), NativeCompaction: p.NativeCompaction, CarriesCompaction: p.CarriesCompaction(), PassUserAgent: !p.MagpieUserAgent, OwnClient: p.OwnClient(), PassErrors: p.PassErrors, TakesPassErrors: p.TakesPassErrors(), AuthHeader: p.AuthHeader, BothAuth: p.BothAuth(), BalanceURL: p.BalanceURL, BalancePath: p.BalancePath, BalanceMethod: p.BalanceMethod, NoBalanceProbe: p.NoBalanceProbe, ModelsURL: p.ModelsURL, ListOff: p.ListsOff(), TakesListOff: p.Account == nil && !p.IsPlugin() && !p.DecideOnly(), TakesModelHeaders: p.Account == nil, DecideAPIKind: p.DecideAPIKind(),
 		Ready: p.Ready(), Chosen: p.PicksOf(avail), Agents: make([]providerAgent, 0, len(agents)),
+		Sub2API: provider.Sub2APISafeBinding(p), Sub2APIRevision: provider.Sub2APIRevision(p), SaveRevision: p.SaveRevision,
 		Fallback: p.Fallback, Routing: p.Routing, Sink: p.Sink, UseFirst: p.UseFirst, NoStandIn: p.NoStandIn, Affinity: p.Affinity, KeepLogin: p.KeepLogin, KeepLoginAs: p.KeepLoginAs, SwitchOnly: p.SwitchOnly, RestartApp: p.RestartApp, Self: p.SelfAnswered(), KeepSelf: p.KeepSelf, ThisDevice: p.ThisDevice, CapStop: p.CapStop, CapCareful: p.CapCareful, Unlisted: p.Unlisted, NoModels: p.ServesNone(), BestInFamily: p.BestInFamily && len(p.Models) == 0 && !p.NoModels, Off: p.Off, Contexts: p.Contexts,
 		MaxConcurrency: p.MaxConcurrency, PluginConcurrency: p.PluginConcurrency(), MaxAccounts: p.MaxAccounts, PluginAccounts: p.PluginAtOnce(), PriceRate: p.PriceRate, KeyPriceRates: p.KeyPriceRates, TopUpRate: p.TopUpRate, KeyGroupRates: keyGroupRatesOf(p),
 		RateWindows: p.RateWindows, RateNow: rateNowOf(p, time.Now()),
@@ -2068,7 +2072,8 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			AccessKeyID    *string `json:"accessKeyID"`
 			ClearAccessKey bool    `json:"clearAccessKey"`
 			// From is the id the provider had: another is a rename
-			From string `json:"from"`
+			From         string `json:"from"`
+			SaveRevision string `json:"saveRevision"`
 			// LibraryMCP, on a Remote magpie, is its editor's switch: its
 			// router a Library server (library.SetRemoteMCP); left out,
 			// it stays as it is
@@ -2652,10 +2657,8 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				if in.Patience == 0 && old != nil {
 					in.Patience = old.Patience
 				}
-				// each account's own proxy likewise: {} clears them
-				if in.AccountProxies == nil && old != nil {
-					in.AccountProxies = old.AccountProxies
-				}
+				// Omitted account proxies and keys are kept under the write lock;
+				// {} explicitly clears proxies, and a nonempty key replaces it.
 				// each account's own models are set on their own, with
 				// accountmodels
 				if old != nil {
@@ -2720,9 +2723,6 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				// and a Vertex AI provider's project and credentials
 				if in.Vertex == nil && old != nil {
 					in.Vertex = old.Vertex
-				}
-				if in.Key == "" && old != nil {
-					in.Key = old.Key
 				}
 				if in.BalanceToken == "" && old != nil && !req.ClearBalanceToken {
 					in.BalanceToken = old.BalanceToken
@@ -2799,7 +2799,7 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 					fail(rw, fmt.Errorf("%s can't carry Codex's native compaction: only a provider with a Responses API, a ChatGPT account or GitHub Copilot can", cmp.Or(in.Name, in.ID)))
 					return
 				}
-				if err := provider.Save(in); err != nil {
+				if err := provider.SaveWithRevision(in, req.SaveRevision); err != nil {
 					fail(rw, err)
 					return
 				}

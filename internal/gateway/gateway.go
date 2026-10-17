@@ -995,6 +995,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		go provider.KeepRemoteListsFollowed(ctx)
 		// and reads the group rate of each key of a relay given a top-up rate (@YIXIE233 on X)
 		go provider.KeepKeyRatesRead(ctx)
+		go provider.KeepSub2API(ctx)
 		// and keeps the community's plugins up to date, noting others' updates, and the Bun they run on
 		go plugin.KeepUpdated(ctx)
 		go plugin.KeepBunUpdated(ctx)

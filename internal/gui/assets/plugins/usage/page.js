@@ -194,6 +194,7 @@ async function loadUsage(asked) {
   if (usageTab === "sessions") return loadSessions();
   if (usageTab === "requests") return loadLedger(asked && ledger && ledgerWant === ledParams({ offset: ledOffset, limit: LED_PAGE }) ? "open" : false);
   if (usageTab === "context") return window.loadContext?.();
+  if (usageTab === "sub2api") return window.Sub2API?.renderUsage($("#sub2apiPane"), false, true);
   // the figures on hand are this period's: opened again (its tab pressed
   // while on it, the Overview's tab) they stay, and are read again behind
   // them as the timer reads them, so the page neither empties nor moves
@@ -4207,7 +4208,7 @@ function ledSaid(p, model) {
   return part;
 }
 
-const USAGE_TABS = [["usage", "Overview"], ["requests", "Requests"], ["sessions", "Sessions"], ["context", "Context"]];
+const USAGE_TABS = [["usage", "Overview"], ["requests", "Requests"], ["sessions", "Sessions"], ["context", "Context"], ["sub2api", "Sub2API groups"]];
 let usageTab = "usage";
 try { const k = localStorage.getItem("magpie.usageTab"); if (USAGE_TABS.some(([id]) => id === k)) usageTab = k; } catch {}
 let sessAgent = "all";
@@ -4263,7 +4264,9 @@ function renderUsageTab() {
   const seg = $("#usageTab");
   seg.replaceChildren();
   for (const [id, name] of USAGE_TABS) {
-    const b = el("button", "opt" + (id === usageTab ? " on" : ""), t(name));
+    const b = el("button", "opt" + (id === usageTab ? " on" : ""));
+    b.append(el("span", "usage-tab-label", t(name)));
+    b.title = t(name);
     b.dataset.seg = id;
     b.onclick = () => {
       if (id === usageTab) return;
@@ -4279,7 +4282,7 @@ function renderUsageTab() {
   slide(seg, "usageTab");
   const on = usageTab === "sessions";
   // the Context tab has its own range, in its pane
-  $("#period").hidden = on || usageTab === "context";
+  $("#period").hidden = on || usageTab === "context" || usageTab === "sub2api";
   $("#sessRange").hidden = !on;
   $("#ctxRange").hidden = usageTab !== "context";
   $("#usagePane").hidden = usageTab !== "usage";
@@ -4287,6 +4290,7 @@ function renderUsageTab() {
   $("#sessionsPane").hidden = !on;
   ledReqShown();
   $("#contextPane").hidden = usageTab !== "context";
+  $("#sub2apiPane").hidden = usageTab !== "sub2api";
 }
 
 const sessDays = () => SESS_RANGES.find(([id]) => id === sessRange)[2];
@@ -5609,6 +5613,7 @@ function usageDrawn() {
   if (usageTab === "sessions") return !!(sessions && sessStats);
   if (usageTab === "requests") return !!ledger;
   if (usageTab === "context") return true; // loadContext keeps what it drew when nothing changed
+  if (usageTab === "sub2api") return true;
   return !!usage && !$("#view-usage").classList.contains("loading");
 }
 function refreshUsage(now = false) {
@@ -5627,6 +5632,8 @@ function refreshUsage(now = false) {
         if (ledger && (want || !ledOffset)) await loadLedger(true);
       } else if (usageTab === "context") {
         await window.loadContext?.();
+      } else if (usageTab === "sub2api") {
+        await window.Sub2API?.renderUsage($("#sub2apiPane"), want);
       } else {
         // the reader asking reads the allowances afresh, a Claude account's by
         // running Claude Code's own /usage (the backend runs it at most once in 30s)
@@ -5684,7 +5691,7 @@ usageTicks();
 if (mode === "window" && params.get("view") === "usage") {
   // An explicit destination takes precedence over the remembered tab.
   const tab = params.get("tab");
-  if (tab === "requests" || tab === "usage") usageTab = tab;
+  if (tab === "requests" || tab === "usage" || tab === "sub2api") usageTab = tab;
   // a total in the menu bar opens the Overview at its period
   const per = params.get("period");
   if (keptPeriod(per)) period = per;

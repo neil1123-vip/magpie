@@ -25,6 +25,9 @@ func TestProviderBilling(t *testing.T) {
 	providerRoutes(mux, nil)
 	do := func(method, path, body string, code int) string {
 		t.Helper()
+		if path == "/api/provider/save" {
+			body = currentProviderForm(t, body)
+		}
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest(method, path, strings.NewReader(body)))
 		if w.Code != code {

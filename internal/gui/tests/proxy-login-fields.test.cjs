@@ -204,7 +204,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await meAgain.user.inputValue(), LOGIN.user);
       assert.equal(await meAgain.pass.inputValue(), LOGIN.pass);
       saved = await save(page, posts);
-      assert.deepEqual(saved.body.accountProxies, { "me@example.com": JOINED, "spare@example.com": "direct" });
+      assert.equal(saved.body.accountProxies, undefined, "an unchanged login leaves the independently stored proxies alone");
 
       // a pasted URL with a login separates, and saves as it came
       await openEditor(page, "Codex", ".editor .acct-proxy");
@@ -214,7 +214,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await creds(mine).user.inputValue(), LOGIN.user);
       assert.equal(await creds(mine).pass.inputValue(), LOGIN.pass);
       saved = await save(page, posts);
-      assert.deepEqual(saved.body.accountProxies, { "me@example.com": JOINED, "spare@example.com": "direct" });
+      assert.equal(saved.body.accountProxies, undefined, "pasting the same login does not replace the proxy map");
 
       await openEditor(page, "Relay", ".editor .acct-proxy");
       const team = creds(line(page, "aaaaaaaaaa"));

@@ -25,7 +25,7 @@ func TestProviderSaveResolve(t *testing.T) {
 	post := func(body string) *httptest.ResponseRecorder {
 		t.Helper()
 		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(body)))
+		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(currentProviderForm(t, body))))
 		return w
 	}
 	saved := func() map[string][]string {

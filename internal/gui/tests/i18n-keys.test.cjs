@@ -46,7 +46,8 @@ test("a plugin's words are its own", () => {
       const p = path.join(d, e.name);
       if (e.isDirectory()) {
         // third_party is vendored code, which says nothing to the window
-        if (!["node_modules", ".git", "site", "tests", "testdata", "docs", "third_party"].includes(e.name)) walk(p);
+        if (!e.name.startsWith(".tmp-") &&
+          !["node_modules", ".git", ".worktrees", "site", "tests", "testdata", "docs", "third_party"].includes(e.name)) walk(p);
       } else if (/\.(go|js|html|css)$/.test(e.name) && e.name !== "i18n.js" && !e.name.endsWith("_test.go")) {
         // a Go test says nothing to the window: claude_image_budget_test.go's
         // "turn i, with an image" turned this red for a day (#6877)

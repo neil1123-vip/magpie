@@ -16,6 +16,7 @@ const { chromium, webkit } = require("playwright");
 const assets = path.resolve(__dirname, "../assets");
 const base = {
   icon: "generic", responses: "", anthropic: "", catalog: "",
+  saveRevision: "saved-revision",
   models: [{ id: "model-1", name: "Model 1", on: true }, { id: "gemini-3-flash", name: "Gemini 3 Flash", on: true }], agents: [], fallback: [], headers: {},
   key: { set: true, masked: "sk-…one" }, keyList: [], balanceToken: { takes: false, set: false }, proxy: "", maxConcurrency: null,
 };
@@ -39,7 +40,9 @@ function serve(lang, posts) {
     if (url.pathname === "/api/providers") return json(providers);
     if (url.pathname === "/api/groups") return json({ groups: [] });
     if (url.pathname.startsWith("/api/provider/") && route.request().method() === "POST") {
-      posts.push({ action: url.pathname.slice("/api/provider/".length), body: route.request().postDataJSON() });
+      const body = route.request().postDataJSON();
+      assert.equal(body.saveRevision, "saved-revision");
+      posts.push({ action: url.pathname.slice("/api/provider/".length), body });
       return json(providers);
     }
     if (url.pathname.startsWith("/api/")) return json({});

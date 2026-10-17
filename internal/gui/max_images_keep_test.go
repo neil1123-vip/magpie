@@ -27,7 +27,7 @@ func TestProviderSaveKeepsMaxImages(t *testing.T) {
 	providerRoutes(mux, nil)
 	post := func(body string) *httptest.ResponseRecorder {
 		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(body)))
+		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(currentProviderForm(t, body))))
 		return w
 	}
 	set := func() map[string]int {

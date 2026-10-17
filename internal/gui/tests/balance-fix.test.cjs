@@ -278,6 +278,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
             const fix = page.locator(".editor .bal-fix");
             await fix.waitFor();
+            await page.waitForFunction(() => document.querySelectorAll(".editor .bal-fix button").length === 2);
             assert.equal(await fix.getByRole("button").count(), 2, "both account balance shortcuts are offered");
             assert.match(await fix.textContent(), /\/api\/user\/self/);
             assert.match(await fix.textContent(), /\/api\/v1\/user\/profile/);

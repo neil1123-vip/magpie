@@ -7,7 +7,7 @@ package provider
 // when it runs out at the pace it has been spent: a least-squares line
 // through the points since the last top-up, over the last balanceFitSpan.
 //
-// Kept in balance-history.json, by provider and key name: the amount only,
+// Kept in balance-history.json, by card or panel account query: the amount only,
 // no key and nothing else of the vendor's. A balance kept from before
 // (AsOf), failed, or told as several amounts or a percent (BalanceParts)
 // isn't one to keep. A balance in several currencies at once (DeepSeek's
@@ -69,7 +69,7 @@ type BalanceTrend struct {
 	Currency string `json:"currency,omitempty"`
 }
 
-// balanceHist is the file: key ("provider|user") → points.
+// balanceHist is the file: card or panel account query key → points.
 type balanceHist map[string][]BalancePoint
 
 var balanceHistMu sync.Mutex
@@ -139,6 +139,17 @@ func addBalancePoint(pts []BalancePoint, n BalancePoint) []BalancePoint {
 	return append(pts, n)
 }
 
+func balanceHistKey(q SubscriptionQuota) string {
+	if q.Sub2API != "" {
+		if q.sub2apiBalance == nil || q.sub2apiBalance.query == "" {
+			return ""
+		}
+		// The displayed source can change without changing the account query.
+		return "sub2api|" + q.sub2apiBalance.query
+	}
+	return quotaHistKey(q.Provider, q.User)
+}
+
 // balancePointsOf is the points q's balance makes, by the key each is kept
 // under, if it is one to keep: one under the card's key, or, told in
 // several currencies, one for each under the card's key and the currency.
@@ -147,12 +158,15 @@ func balancePointsOf(q SubscriptionQuota, now time.Time) map[string]BalancePoint
 	if q.Error != "" || q.AsOf != nil || q.Estimate != nil || q.Provider == "" || q.Balance == "" || len(q.BalanceParts) > 0 {
 		return nil
 	}
+	key := balanceHistKey(q)
+	if key == "" {
+		return nil
+	}
 	at := now
 	if q.ReadAt != nil && !q.ReadAt.After(now) {
 		at = *q.ReadAt
 	}
 	at = at.UTC().Truncate(time.Second)
-	key := quotaHistKey(q.Provider, q.User)
 	if cs := balanceCurrencies(q.Balance); cs != nil {
 		out := map[string]BalancePoint{}
 		for _, c := range cs {
@@ -219,7 +233,7 @@ func noteBalanceHistory(qs []SubscriptionQuota, now time.Time) {
 		if len(pts) > 0 && h == nil {
 			h = readBalanceHist()
 		}
-		if card := quotaHistKey(q.Provider, q.User); len(pts) > 1 && len(h[card]) > 0 {
+		if card := balanceHistKey(q); len(pts) > 1 && len(h[card]) > 0 {
 			// the card's own line, kept before its currencies were told
 			// apart, took whichever came first in a read and can't be
 			// split again: it goes
@@ -263,7 +277,11 @@ func noteBalanceHistory(qs []SubscriptionQuota, now time.Time) {
 		if h == nil {
 			h = balanceHistShared() // read only from here on
 		}
-		key := quotaHistKey(q.Provider, q.User)
+		key := balanceHistKey(q)
+		if key == "" {
+			qs[i].BalanceTrend = nil
+			continue
+		}
 		cs := balanceCurrencies(q.Balance)
 		if cs != nil {
 			key = currencyHistKey(key, cs[0].Sign)

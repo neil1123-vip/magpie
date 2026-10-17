@@ -2935,25 +2935,31 @@ func EffectivePriceIn(s settings.Settings, providerID, model string) (catalog.Pr
 // each record's window rate on itself, so one read of the prices serves
 // every time of day.
 func EffectivePriceAt(s settings.Settings, providerID, model string, at time.Time) (catalog.Price, bool) {
-	// A price is keyed by the id the provider has now, so one written before
-	// a rename is read under the id it has. Only an id, or one the provider
-	// was renamed from, resolves; anything else is looked up as given, so a
-	// key under a display name counts only for a caller naming that name
-	// too. Nothing writes such a key — SetModelPrice re-keys the way
-	// SetModelName does — which is what keeps the two from drifting.
-	return priceIn(s, All(), providerID, model, at)
+	return priceIn(s, All(), providerID, model, "", at)
+}
+
+// EffectiveKeyPriceIn uses the confirmed key's local rate when the call names
+// its actual fingerprint. Calls without one keep the source's rate.
+func EffectiveKeyPriceIn(s settings.Settings, providerID, model, keyID string) (catalog.Price, bool) {
+	return priceIn(s, All(), providerID, model, keyID, time.Now())
 }
 
 // priceIn is EffectivePriceIn with the providers read already, for a
 // caller pricing many models at once: All() copies every provider each
 // time it is read, so a list read it once a model, 30 providers' copies
 // for each of hundreds of models (EntryPricer).
-func priceIn(s settings.Settings, all []Provider, providerID, model string, at time.Time) (catalog.Price, bool) {
+func priceIn(s settings.Settings, all []Provider, providerID, model, keyID string, at time.Time) (catalog.Price, bool) {
+	// A price is keyed by the id the provider has now, so one written before
+	// a rename is read under the id it has. Only an id, or one the provider
+	// was renamed from, resolves; anything else is looked up as given, so a
+	// key under a display name counts only for a caller naming that name
+	// too. Nothing writes such a key — SetModelPrice re-keys the way
+	// SetModelName does — which is what keeps the two from drifting.
 	p, known := byIDOrWasIn(all, providerID)
 	if !known {
 		p = Provider{ID: providerID}
 	}
-	return priceOf(s, p, known, model, at)
+	return priceOf(s, p.atKeyRate(keyID), known, model, at)
 }
 
 // BasePriceIn is EffectivePriceAt without a rate window's rate: what the
@@ -3134,7 +3140,7 @@ func entryPricerAt(st settings.Settings, find func(string) (Group, []Member, boo
 	all := sharedAll() // priceIn only reads them
 	return func(e Entry) (catalog.Price, bool) {
 		if e.Group == "" {
-			return priceIn(st, all, e.Provider.ID, e.Model, now)
+			return priceIn(st, all, e.Provider.ID, e.Model, "", now)
 		}
 		_, ms, ok := find(e.ID)
 		if !ok || len(ms) == 0 {
@@ -3142,7 +3148,7 @@ func entryPricerAt(st settings.Settings, find func(string) (Group, []Member, boo
 		}
 		var first catalog.Price
 		for i, m := range ms {
-			pr, ok := priceIn(st, all, m.Provider.ID, m.Model, now)
+			pr, ok := priceIn(st, all, m.Provider.ID, m.Model, "", now)
 			if !ok || m.Fast || i > 0 && !pr.Same(first) {
 				return catalog.Price{}, false
 			}
@@ -3179,7 +3185,7 @@ func AgentPricer(st settings.Settings, find func(string) (Group, []Member, bool)
 		if !ok || len(ms) == 0 || ms[0].Fast {
 			return catalog.Price{}, false
 		}
-		return priceIn(st, all, ms[0].Provider.ID, ms[0].Model, base)
+		return priceIn(st, all, ms[0].Provider.ID, ms[0].Model, "", base)
 	}
 }
 

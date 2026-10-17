@@ -28,7 +28,7 @@ func TestSaveKeepsGeminiCleared(t *testing.T) {
 	providerRoutes(mux, nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(
-		`{"id":"google","name":"Google Gemini","preset":"google","chat":"`+provider.AIStudioChat+`","gemini":""}`)))
+		currentProviderForm(t, `{"id":"google","name":"Google Gemini","preset":"google","chat":"`+provider.AIStudioChat+`","gemini":""}`))))
 	if w.Code != 200 {
 		t.Fatalf("%d %s", w.Code, w.Body)
 	}

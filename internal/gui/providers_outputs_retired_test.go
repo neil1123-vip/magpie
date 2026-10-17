@@ -27,7 +27,7 @@ func TestProviderSaveKeepsRetiredModelOutput(t *testing.T) {
 	post := func(body string) *httptest.ResponseRecorder {
 		t.Helper()
 		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(body)))
+		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(currentProviderForm(t, body))))
 		return w
 	}
 	if w := post(`{"id":"relay","name":"Relay","key":"k","chat":"http://127.0.0.1:1/v1","models":["sol","space-bunny-free"],"new":true}`); w.Code != 200 {

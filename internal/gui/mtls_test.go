@@ -160,7 +160,7 @@ func TestProviderSaveClientCert(t *testing.T) {
 	post := func(body string) (int, string) {
 		t.Helper()
 		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(body)))
+		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(currentProviderForm(t, body))))
 		return w.Code, w.Body.String()
 	}
 	base := `{"id":"home","name":"Home","key":"k","chat":"https://home.example:3425/v1","icon":"generic"`

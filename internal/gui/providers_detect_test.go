@@ -49,6 +49,9 @@ func TestProviderDetect(t *testing.T) {
 	providerRoutes(mux, nil)
 	post := func(action, body string) *httptest.ResponseRecorder {
 		t.Helper()
+		if action == "save" {
+			body = currentProviderForm(t, body)
+		}
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/"+action, strings.NewReader(body)))
 		return w

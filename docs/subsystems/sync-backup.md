@@ -127,6 +127,14 @@ copies off the computers that have one. A file backup (`backup.Collect`) still
 carries the provider, with the mark, and a Restore keeps the mark a provider
 here has.
 
+Sub2API credentials, monitor state and browser profiles stay on their
+computer under `sub2api-local` or the host's temporary profile directory.
+Portable provider bindings carry references, not tokens or passwords.
+Restore and Mirror replace imported binding tickets with local ones;
+an unchanged binding preserves its local ticket. A restored reference
+without a local session requires sign-in. See
+[Sub2API accounts and group rates](sub2api.md).
+
 Sharing turned on at one computer never turns it on or off at another
 (Lullaby on Discord). A backup restored onto a new computer leaves sharing as
 that computer has it, off on a fresh one: sharing opens the gateway to the

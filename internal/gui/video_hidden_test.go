@@ -26,7 +26,7 @@ func TestVideoModelsHidden(t *testing.T) {
 	post := func(body string) {
 		t.Helper()
 		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(body)))
+		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(currentProviderForm(t, body))))
 		if w.Code != 200 {
 			t.Fatalf("%d %s", w.Code, w.Body.String())
 		}

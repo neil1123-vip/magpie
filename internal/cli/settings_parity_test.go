@@ -261,6 +261,8 @@ var notYet = map[string]string{
 	"POST /api/quit/disconnect":                  W,  // api.go: the Quit question's Disconnect and quit, which quits the app
 	"POST /api/restart":                          W,  // restart.go: the app starting itself again, as the tray's Restart magpie does
 	"POST /api/page-away":                        W,  // api.go: the page says it went from view, so its caches can go
+	"GET /api/sub2api":                           W,  // sub2api.go: Windows desktop account and group management
+	"POST /api/sub2api/{action}":                 W,  // sub2api.go: changes require the Windows desktop app
 	"GET /api/remote":                            W,  // remote.go: another magpie opened in a window of the app
 	"POST /api/remote":                           W,  // remote.go
 	"POST /api/remote/forget":                    W,  // remote.go

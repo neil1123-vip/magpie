@@ -28,7 +28,7 @@ func TestProviderSaveTopUpRate(t *testing.T) {
 		t.Helper()
 		w := httptest.NewRecorder()
 		body := `{"id":"relay","from":"relay","name":"Relay","key":"","chat":"http://127.0.0.1:1/v1","icon":"generic","models":[],"headers":{}` + extra + `}`
-		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(body)))
+		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(currentProviderForm(t, body))))
 		return w.Code
 	}
 	listed := func() float64 {
@@ -62,8 +62,8 @@ func TestProviderSaveTopUpRate(t *testing.T) {
 		t.Fatalf("left out, not kept: %d %v", c, listed())
 	}
 	for _, bad := range []string{"-1", "1001", "0.07142", `"abc"`} {
-		if c := post(`,"topUpRate":` + bad); c == 200 {
-			t.Fatalf("%s taken", bad)
+		if c := post(`,"topUpRate":` + bad); c != http.StatusBadRequest {
+			t.Fatalf("invalid top-up rate %s: %d", bad, c)
 		}
 	}
 	if got := listed(); got != 0.07 {
