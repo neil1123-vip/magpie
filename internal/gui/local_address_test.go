@@ -23,6 +23,7 @@ func TestProviderSaveLocalPresetAtItsURLs(t *testing.T) {
 	providerRoutes(mux, nil)
 	post := func(body string) {
 		t.Helper()
+		body = currentProviderForm(t, body)
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(body)))
 		if w.Code != 200 {
@@ -66,6 +67,7 @@ func TestProviderSaveLocalPresetAtItsURLs(t *testing.T) {
 		m.ID, m.Chat, m.Responses, m.Anthropic, m.Decide = "", "", "", "", ""
 		d.Name, m.Name = "", ""
 		d.Models, m.Models = nil, nil
+		d.SaveRevision, m.SaveRevision = "", ""
 		if d.Preset != c.id || d.Icon != c.id || !reflect.DeepEqual(d, m) {
 			t.Fatalf("%s moved lost its preset's: default %+v\nmoved %+v", c.id, d, m)
 		}

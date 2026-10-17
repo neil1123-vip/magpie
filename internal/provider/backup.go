@@ -44,6 +44,7 @@ func Restore(ps []Provider) (added, replaced int, err error) {
 			}
 		}
 		if i < 0 {
+			p.Sub2API = importedSub2APIBinding(p)
 			f.Providers = append(f.Providers, p)
 			added++
 			continue
@@ -115,6 +116,7 @@ func Mirror(ps []Provider, gs []Group) error {
 			p.KeepLogin, p.KeepLoginAs, p.SwitchOnly = h.KeepLogin, h.KeepLoginAs, h.SwitchOnly
 		} else {
 			p.KeepLoginAs = "" // an account signed in on the other computer
+			p.Sub2API = importedSub2APIBinding(p)
 		}
 		out = append(out, p)
 	}

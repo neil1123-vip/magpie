@@ -1,0 +1,2 @@
+# Unified diff context preserves the upstream indentation and empty lines.
+wails-native-hooks.patch whitespace=-blank-at-eol,-space-before-tab

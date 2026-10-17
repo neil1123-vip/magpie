@@ -7,6 +7,20 @@ with no binding generator and no bundler. `magpie web` serves the same page
 to a browser for a machine with no desktop. Package `internal/gui` hosts all
 three.
 
+The source editor's Sub2API sign-in and Usage's Sub2API groups tab use a
+desktop-gated API. Their account lifecycle, background monitor and isolated
+Windows browser host are described in
+[Sub2API accounts and group rates](sub2api.md).
+
+Windows desktop builds also use the pinned
+[toast factory patch](../../build/sub2api-webview2/README.md).
+It supplies the COM receiver and releases the activation factory for both
+notification manager lookup and toast creation. The upstream null receiver
+can terminate the app when a background notification fires; ordinary Wails
+alerts and Sub2API alerts share this dependency. The prepared modfile is
+required for this fix. `TestToastFactories` calls both real Windows factories
+in separate child processes without displaying notifications.
+
 ## Responsibilities and sources of truth
 
 | Part | Responsibility | Source |
@@ -36,6 +50,24 @@ three.
 9. Settings › General › Quick panel shortcut binds a key combination that opens the tray's panel from any app (ben hanks on Discord); none is set by default. The page records the keys and posts them to `POST /api/settings/panel-shortcut`, which checks them (`panelShortcut`: a letter, digit, Space or F1–F20 with Ctrl, Alt/Option or Cmd/Super, or an F key alone, written as Wails' accelerator), has the running app bind them (`onPanelShortcut`, `bindPanelKey` through Wails' `GlobalShortcut`: Carbon's hot keys on the Mac, `RegisterHotKey` on Windows, `XGrabKey` on X11) and saves them only once bound. One the system refuses (on Windows and X11, another app holding it) is not saved and the old one stays bound; one saved but refused as magpie starts is retried after a handed-over magpie exits and else said in the row (`panelKeysJSON.Taken`). A pressed shortcut toggles the panel as a tray click does (`togglePanel`). The Mac's Carbon hot keys don't refuse a combination another app registered too, so there both are taken and magpie can't tell the user. The shortcut is per computer (`KeepOwn`), and the Mac's old process lets go of it as it hands over (`leaveMenuBar`). On Wayland no app may grab keys itself, so the field is off and the row says the command to bind in the desktop's own keyboard settings (`magpie panel`); Wails' GlobalShortcuts portal is not used, since the compositor decides its keys and Hyprland binds none unless configured. From there a not-connected Claude Code's or Codex's opened row switches its account (shuizhuyu on X, [Switch accounts only](providers-accounts.md)).
 
 ## Constraints and failure behavior
+
+### Provider-list ordering
+
+`api` in [`app.js`](../../internal/gui/assets/app.js) coordinates shared
+`providers` reads and source, key and account writes. Reads begun before a
+write finishes follow a current read, on success or failure. A late provider
+list cannot undo an acknowledged source edit or price application. Each new
+read makes its own request, so a newly opened page can finish while an older
+page's request is pending; `providers?wait=1` keeps its wait semantics.
+`providers?last=1` reads a cached placeholder independently: it neither
+supersedes nor invalidates a live read, even when it arrives later or returns
+null. The Providers loader replaces this placeholder with the live list.
+Writes run once; if overlapping writes or an accepted read after a write
+began make its returned list uncertain, only the list is read again. This
+also covers a read that observed another window's change, and a read that
+finished before the pending write committed. Calls with their own
+response-header callback or cancellation signal
+keep independent requests and cancellation.
 
 ### Allowance card refreshes
 

@@ -515,7 +515,8 @@ var ownPrice catalog.Price
 
 // Pricer uses the same effective price as the model CLI and session totals:
 // explicit provider/model or provider-wide prices (including zero), then the
-// provider catalog, then the maker catalog. Settings are read once per query.
+// provider catalog, then the maker catalog, at the actual key's local rate
+// when known. Settings are read once per query.
 //
 // A model no price is known for is priced as the model the vendor's reply
 // said answered (Served), at the same provider, when that one has a price:
@@ -526,7 +527,7 @@ var ownPrice catalog.Price
 // windows (#2463) is priced at that window's rate, its own time read
 // against the windows, so calls either side of a boundary price apart.
 func Pricer() func(Record) *catalog.Price {
-	prices := map[[3]string]*catalog.Price{}
+	prices := map[[4]string]*catalog.Price{}
 	// each provider's rate windows as the same read of the prices saw
 	// them: the windows are held once (BasePriceIn), each record's rate
 	// read at its own time (provider.RateAt), so a window that opens
@@ -542,14 +543,14 @@ func Pricer() func(Record) *catalog.Price {
 			served = ""
 		}
 		id := r.priceID()
-		k := [3]string{id, r.Model, served}
+		k := [4]string{id, r.Model, served, r.ProviderKeyID}
 		if pr, ok := prices[k]; ok {
 			return atWindow(pr, windows[id], r.Time)
 		}
 		var pr *catalog.Price
-		v, ok, ws := provider.BasePriceIn(s, id, r.Model)
+		v, ok, ws := provider.BaseKeyPriceIn(s, id, r.Model, r.ProviderKeyID)
 		if !ok && served != "" {
-			v, ok, ws = provider.BasePriceIn(s, id, served)
+			v, ok, ws = provider.BaseKeyPriceIn(s, id, served, r.ProviderKeyID)
 		}
 		if ok {
 			pr = &v

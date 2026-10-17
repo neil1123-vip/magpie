@@ -13,7 +13,17 @@ Plugin ownership of the deprecated built-in subscriptions is in
 [Provider and plugin ownership](provider-plugins.md). How the gateway orders
 keys and accounts per request is in [Gateway routing and fallback](gateway-routing.md).
 
+Sub2API panel credentials, existing balance bindings, background group-rate
+monitoring and manual price application are described in
+[Sub2API accounts and group rates](sub2api.md).
+
 ## Responsibilities and sources of truth
+
+The editor's `SaveRevision` checks the stored fields its main form can replace.
+Account-model picks are saved separately, including before that form's Save;
+`SaveWithRevision` excludes them from its revision and preserves their latest
+stored value. Other changed fields still reject a stale form. The provider-file
+comparison also rejects a write when the file changes during the operation.
 
 | Part | Responsibility | Source |
 | --- | --- | --- |
@@ -75,6 +85,7 @@ keys and accounts per request is in [Gateway routing and fallback](gateway-routi
 ## 原生搜索检测
 
 自定义供应商编辑器的“自己能联网搜索”旁有“检测”按钮。
+搜索与压缩检测共用的前端组件在 `provider-tests.js`，打开相应编辑器时按需加载。
 `POST /api/provider/test-search` 使用当前表单的地址、模型选择、
 请求头、额外请求体、代理和鉴权方式；未重填密钥时沿用已保存供应商
 或复制来源的密钥。新建预设使用其默认端点；明确清空的端点不会回退。

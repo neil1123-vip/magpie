@@ -113,7 +113,49 @@ const sameRead = (a, b) => a === b || !(readTags.has(a) && readTags.has(b)) && J
 
 // heads, when given, is shown the answer's headers (loadQuotas' X-Magpie-Reading);
 // signal, when given, cancels the request (a read the reader moved on from)
+let providerFlight = null, providerWait = false, providerWrites = 0, providerReads = 0;
 async function api(path, body, heads, signal) {
+  if (body === undefined && /^providers(?:\?|$)/.test(path) && !/[?&]last=1(&|$)/.test(path)) {
+    if (heads || signal) {
+      const before = providerWrites;
+      try {
+        const next = await apiRequest(path, body, heads, signal);
+        if (before !== providerWrites) return api(path, body, heads, signal);
+        providerReads++;
+        return next;
+      } catch (error) {
+        if (signal?.aborted || before === providerWrites) throw error;
+        return api(path, body, heads, signal);
+      }
+    }
+    const follow = () => providerFlight && (path === "providers" || providerWait) ? providerFlight : api(path);
+    const pending = apiRequest(path, body, heads, signal).then(
+      (next) => { if (providerFlight !== pending) return follow(); providerReads++; return next; },
+      (error) => { if (providerFlight !== pending) return follow(); throw error; });
+    providerFlight = pending;
+    providerWait = path !== "providers";
+    try { return await pending; } finally { if (providerFlight === pending) providerFlight = null; }
+  }
+  const writing = body !== undefined && /^(providers?(?:\/|$)|sub2api\/|keys\/|login\/|signin\/|stepfun\/|importapps$)/.test(path);
+  const before = providerWrites, reads = providerReads;
+  let result, crossed;
+  try { result = await apiRequest(path, body, heads, signal); }
+  finally {
+    if (writing) { crossed = before !== providerWrites || reads !== providerReads; providerWrites++; providerFlight = null; }
+  }
+  const field = Array.isArray(result?.providers) ? ""
+    : ["state", "providers"].find((key) => Array.isArray(result?.[key]?.providers));
+  if (body !== undefined && field !== undefined) {
+    if (!writing) { crossed = before !== providerWrites || reads !== providerReads; providerWrites++; providerFlight = null; }
+    // Crossed lists may be stale.
+    if (crossed) {
+      const current = await api("providers");
+      return field ? { ...result, [field]: current } : { ...result, ...current };
+    }
+  }
+  return result;
+}
+async function apiRequest(path, body, heads, signal) {
   if (web && path === "open") { window.open(body.url, "_blank", "noopener"); return null; }
   // a segment may be an agent id, and omp's named profiles are omp#<name>:
   // left raw, the browser reads #work as the fragment and the request
@@ -141,6 +183,7 @@ async function api(path, body, heads, signal) {
   }
   if (!res.ok) {
     const err = new Error(data?.error || `${res.status} ${res.statusText}`);
+    err.status = res.status;
     if (data?.code === "runtime_unavailable") {
       err.code = data.code;
       if (data.offline === "stage" || data.offline === "disconnect") err.offline = data.offline;
@@ -6394,6 +6437,7 @@ function renderProviders() {
         try { await loadProviders(); } catch (e) { statusErr(e); return; }
         if (!providers.providers.some((x) => x.id === p.id)) return;
       }
+      await window.Sub2API?.cancelEditor();
       editing = open ? null : p.id; draft = null; renderProviders();
     }; // the preset sheet stays as it is under the dialog
     list.append(row);
@@ -7809,6 +7853,7 @@ function confirmDiscard() {
 }
 async function cancelEdit(keep) {
   if ((providerDirty() || ((importing || importingApps) && modalFormDirty())) && !(await confirmDiscard())) return false;
+  await window.Sub2API?.cancelEditor();
   if (keep !== true) dropSigningIn(editing);
   editing = null; draft = null; acctModels = null; importing = null; importingApps = null; renderProviders();
   return true;
@@ -9218,7 +9263,7 @@ function baseAPIOf(p) {
 
 // draftOf is a saved provider as its editor's form holds it.
 function draftOf(p) {
-  return { id: p.id, name: p.name, preset: p.preset, chat: p.chat, responses: p.responses, anthropic: p.anthropic, gemini: p.gemini || "", catalog: p.catalog, decide: p.decide || "", key: "", api: baseAPIOf(p), chosen: pickedOf(p), none: !!p.noModels, best: !!p.bestInFamily, extra: [], headers: headerRows(p.headers), extraBody: extraBodyText(p.extraBody), replyHeaders: (p.replyHeaders || []).join(", "), icon: p.icon || "", fallback: [...(p.fallback || [])], unlisted: !!p.unlisted, hiddenDrawers: [...(p.hiddenDrawers || [])], searches: !!p.searches, unredacted: !!p.unredacted, insecureTLS: !!p.insecureTLS, limitRestOff: !!p.limitRestOff, nativeCompaction: !!p.nativeCompaction, passUserAgent: !!p.passUserAgent, pinUpstream: !!p.pinUpstream, authHeader: p.authHeader || "", balanceURL: p.balanceURL || "", balancePath: p.balancePath || "", balanceMethod: p.balanceMethod || "", modelsURL: p.modelsURL || "", contexts: contextsText(p.contexts), outputs: contextsText(p.outputs), compacts: contextsText(p.compacts), keysUrl: p.keysUrl || "", ...proxyDraft(p), ...concurrencyDraft(p), rateWindows: (p.rateWindows || []).map((w) => ({ ...w })) };
+  return { id: p.id, name: p.name, preset: p.preset, saveRevision: p.saveRevision || "", chat: p.chat, responses: p.responses, anthropic: p.anthropic, gemini: p.gemini || "", catalog: p.catalog, decide: p.decide || "", key: "", api: baseAPIOf(p), chosen: pickedOf(p), none: !!p.noModels, best: !!p.bestInFamily, extra: [], headers: headerRows(p.headers), extraBody: extraBodyText(p.extraBody), replyHeaders: (p.replyHeaders || []).join(", "), icon: p.icon || "", fallback: [...(p.fallback || [])], unlisted: !!p.unlisted, hiddenDrawers: [...(p.hiddenDrawers || [])], searches: !!p.searches, unredacted: !!p.unredacted, insecureTLS: !!p.insecureTLS, limitRestOff: !!p.limitRestOff, nativeCompaction: !!p.nativeCompaction, passUserAgent: !!p.passUserAgent, pinUpstream: !!p.pinUpstream, authHeader: p.authHeader || "", balanceURL: p.balanceURL || "", balancePath: p.balancePath || "", balanceMethod: p.balanceMethod || "", modelsURL: p.modelsURL || "", contexts: contextsText(p.contexts), outputs: contextsText(p.outputs), compacts: contextsText(p.compacts), keysUrl: p.keysUrl || "", ...proxyDraft(p), ...concurrencyDraft(p), rateWindows: (p.rateWindows || []).map((w) => ({ ...w })) };
 }
 
 // duplicateProvider opens the Add form on a copy of p (#268): its URLs,
@@ -9229,7 +9274,7 @@ function duplicateProvider(p) {
   const name = t("{name} copy", { name: p.name });
   editing = p.preset && providers.presets.some((x) => x.id === p.preset) ? { preset: p.preset } : { custom: true };
   const d = draftOf(p);
-  draft = { ...d, id: slug(name), name, chosen: [], extra: d.chosen, copyOf: p.id };
+  draft = { ...d, id: slug(name), name, saveRevision: "", chosen: [], extra: d.chosen, copyOf: p.id };
   if (p.zhipuTeam) draft.zhipuTeam = { org: p.zhipuTeam.org || "", project: p.zhipuTeam.project || "" };
   if (p.vertex) draft.vertex = { project: p.vertex.project || "", location: p.vertex.location || "", credentials: p.vertex.credentials || "", impersonate: p.vertex.impersonate || "" };
   renderProviders();
@@ -9754,27 +9799,7 @@ function drawEditor(p, presetID) {
 
   if (p?.cline || (isNew && pr?.id === "clinepass")) advIn.append(...upstreamField());
 
-  // a relay in front of Anthropic's or OpenAI's API searches the web as
-  // they do, which magpie can't tell from its host (#359): a client's web
-  // search goes to it as sent, rather than through magpie's own. Only its
-  // Anthropic or Responses API can be asked to: a Chat one has no such tool
-  const testDraft = () => {
-    const proxy = proxyOfDraft();
-    if (proxy === null) throw new Error(t("Proxy: type its address, like http://127.0.0.1:7890"));
-    const own = accountProxiesOfDraft();
-    if (own.missing) {
-      const line = ed.querySelector(`.acct-proxy[data-key="${own.missing}"]`);
-      throw new Error(t("Proxy of {user}: type its address, like http://127.0.0.1:7890", { user: line?.querySelector(".who")?.textContent || own.missing }));
-    }
-    const body = { ...asTyped(), id: p?.id, picked: (p ? chosenIds() : draft.extra || []).slice(0, DETECT_MAX), authHeader: draft.authHeader || "", proxy, accountProxies: own.map };
-    if (!p && pr) {
-      for (const k of ["chat", "responses", "anthropic", "gemini"]) {
-        if (draft[k] === undefined && !body[k]) body[k] = (pr[k] || "").trim();
-      }
-    }
-    if (!p && draft.copyOf) Object.assign(body, { new: true, copyOf: draft.copyOf });
-    return body;
-  };
+  const testDraft = { provider: p, preset: pr, host: ed };
   if (custom) {
     const [stk, scb] = tick(t("Searches the web by itself"), !!draft.searches);
     scb.onchange = () => { draft.searches = scb.checked; };
@@ -9857,38 +9882,9 @@ function drawEditor(p, presetID) {
     advIn.append(...field(t("Rests"), rtk, t("Off: a 429 or an out-of-quota refusal doesn't rest its keys, and the next request is sent to it as usual. For a relay whose limits pass in a moment.")));
   }
 
-  // a vendor that tells the whole account's balance only to a token of its
-  // own (AiHubMix's system access token), where a key knows just its own
-  // — or a custom provider's, whose Balance URL may not be named yet: a
-  // token pasted there says at once which URL it wants (balanceFix)
-  let balFix = null;
-  if (p?.balanceToken?.takes || custom) {
-    const saved = !!p?.balanceToken?.set;
-    const tok = input(draft.balanceToken || "", saved && !draft.clearBalanceToken ? t("saved · paste a new one to replace it") : t("optional · the account's system access token"), "password");
-    tok.oninput = () => { draft.balanceToken = tok.value.trim(); };
-    tok.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Escape") cancelEdit(); };
-    const pair = el("div", "pair");
-    pair.append(tok);
-    if (saved && !draft.clearBalanceToken) {
-      const side = el("div", "side");
-      const drop = el("button", "text", t("Remove"));
-      drop.onclick = () => { draft.clearBalanceToken = true; draft.balanceToken = ""; tok.value = ""; tok.placeholder = t("optional · the account's system access token"); drop.remove(); balFix?.refresh(); };
-      side.append(drop);
-      pair.append(side);
-    }
-    const tokHelp = custom || p.balanceURL
-      ? t("What the Balance URL is asked with in place of the key, when it wants the account's own token: a new-api relay's System Access Token, or a sub2api panel's login token (a JWT, sent as a Bearer); it is used for nothing else.")
-      : t("A key tells only what is left on itself. For the whole account's balance on the Usage page, generate a System Access Token in {p}'s settings and paste it here; it is used for nothing else.", { p: pr?.name || p.name });
-    const [label, wrap] = field(t("Account balance"), pair, tokHelp);
-    if (custom) {
-      balFix = balanceFix(p);
-      wrap.append(balFix);
-      // whatever is typed — the token, the Balance URL, a header — may
-      // make it or unmake it
-      ed.addEventListener("input", () => balFix.refresh());
-    }
-    advIn.append(label, wrap);
-  }
+  const balance = p?.balanceToken?.takes || custom ? el("span") : null;
+  if (balance) advIn.append(balance);
+  if (balance || p?.sub2api) window.Sub2API?.mountEditor(ed, p, balance, custom, pr?.name || p?.name);
 
   // StepFun tells a Step Plan's 5-hour, weekly and credit windows only to
   // its platform's sign-in, never to a key: signed in once in a window of
@@ -10178,9 +10174,12 @@ function drawEditor(p, presetID) {
   const cancel = el("button", "text", t("Cancel"));
   cancel.onclick = cancelEdit;
   const saveBtn = el("button", "text primary", t(isNew ? "Add" : "Save"));
+  saveBtn.disabled = !!draft.saveRevisionConflict;
   const save = () => {
     // new: an Add never replaces a provider that has the id already
+    if (draft.saveRevisionConflict) return editorError("The provider changed; reopen it before saving.", "err");
     const body = { id: p ? slug(draft.id) || p.id : draft.id, from: p?.id, name: draft.name, preset: draft.preset, key: draft.key || "", chat: draft.chat, responses: draft.responses, anthropic: draft.anthropic, gemini: (draft.gemini || "").trim(), catalog: draft.catalog, models: p ? chosenIds() : draft.extra, headers: headersOf(draft.headers), new: isNew };
+    if (p && draft.saveRevision) body.saveRevision = draft.saveRevision;
     if (isNew && draft.copyOf) body.copyOf = draft.copyOf;
     const xb = extraBodyOf(draft.extraBody);
     if (xb.error) { shown(ed.querySelector(".extra-body textarea"))?.focus(NO_SCROLL); return editorError(t("Extra body: {why}", { why: xb.error }), "warn"); }
@@ -10384,53 +10383,10 @@ function nativeCompactionField(show, probe) {
 }
 
 function nativeTestField(control, kind, form) {
-  const words = kind === "search" ? {
-    check: "Check search",
-    title: "Send native web search requests with the form as typed. Uses the provider's quota; nothing is saved.",
-    ok: "Native search confirmed",
-    failed: "Search request failed",
-    unknown: "Not confirmed: no native search result returned",
-    note: "Only the tested model and key are checked. Tick the option yourself to use native search.",
-  } : {
-    check: "Check compaction",
-    title: "Send a native compaction request with the form as typed. Uses the provider's quota; nothing is saved.",
-    ok: "Native compaction confirmed",
-    failed: "Compaction request failed",
-    unknown: "Not confirmed: no encrypted compaction returned",
-    note: "Only the tested model and key are checked. Tick the option yourself to use native compaction.",
-  };
   const wrap = el("div", "detect native-test " + kind + "-test");
-  const controls = el("div", "detect-row");
-  const test = el("button", "text action", t(words.check));
-  test.type = "button";
-  test.title = t(words.title);
-  controls.append(control, test);
-  const out = el("div", "native-test-out");
-  out.hidden = true;
-  out.setAttribute("role", "status");
-  out.setAttribute("aria-live", "polite");
-  wrap.append(controls, out);
-  test.onclick = async () => {
-    if (test.disabled) return;
-    const xb = extraBodyOf(draft.extraBody);
-    if (xb.error) { out.hidden = false; out.replaceChildren(el("div", "hint err", xb.error)); return; }
-    test.disabled = true;
-    test.classList.add("busy");
-    out.hidden = false;
-    out.replaceChildren(el("div", "hint", t("Checking…")));
-    try {
-      const r = await api("provider/test-" + kind, form());
-      out.replaceChildren();
-      for (const x of r.results) {
-        const result = el("div", "hint " + (x.ok ? "ok" : x.error ? "err" : "warn"));
-        const label = apiLabel(x.protocol) + (x.model ? " · " + x.model : "");
-        result.textContent = label + " · " + (x.ok ? t(words.ok) : x.error ? t(words.failed) + ": " + (x.status ? x.status + " · " : "") + t(x.error) : t(words.unknown));
-        out.append(result);
-      }
-      out.append(el("div", "hint", t(words.note)));
-    } catch (e) { out.replaceChildren(el("div", "hint err", e.message)); }
-    finally { test.disabled = false; test.classList.remove("busy"); }
-  };
+  wrap.append(control);
+  import("./provider-tests.js").then((m) => m.mountNativeTest(wrap, control, kind, form))
+    .catch((e) => wrap.append(el("div", "hint err", e.message)));
   return wrap;
 }
 
@@ -11397,7 +11353,11 @@ function renderModels(p) {
     // tall as its chips, which must be more than that to fold
     requestAnimationFrame(() => {
       const most = Math.min(MCHIPS_MAX, innerHeight * 0.4);
-      fold.hidden = !(chips.scrollHeight > (modelsOpen ? most : chips.clientHeight) + 1);
+      const hidden = !(chips.scrollHeight > (modelsOpen ? most : chips.clientHeight) + 1);
+      if (fold.hidden === hidden) return;
+      const scrolling = fold.closest(".ebody"), top = scrolling?.scrollTop;
+      fold.hidden = hidden;
+      if (scrolling) scrolling.scrollTop = top;
     });
   };
   const draw = () => {
@@ -13824,58 +13784,6 @@ function balanceError(err) {
   return "";
 }
 
-// An account token is unused without a Balance URL and can't authenticate
-// /api/usage/token or sub2api's /v1/usage, which take API keys only. Other URLs may belong to
-// another relay and are left alone; both new-api and sub2api issue JWTs.
-function balanceFix(p) {
-  const box = el("div", "bal-fix");
-  const origin = (u) => { try { const x = new URL(u); return /^https?:$/.test(x.protocol) ? x.origin : ""; } catch { return ""; } };
-  box.refresh = () => {
-    box.replaceChildren();
-    box.className = "bal-fix";
-    const tok = !!draft.balanceToken || (!!p?.balanceToken?.set && !draft.clearBalanceToken);
-    if (!tok) return;
-    const u = (draft.balanceURL || "").trim();
-    let path = "";
-    try { path = new URL(u).pathname.replace(/\/+$/, ""); } catch {}
-    let why = "";
-    if (path === "/api/usage/token") why = t("…/api/usage/token takes the API key, not this token: for the account's balance, new-api uses /api/user/self; sub2api uses /api/v1/user/profile.");
-    else if (path === "/v1/usage") why = t("…/v1/usage takes the API key, not this token: for the account's balance, a sub2api panel uses /api/v1/user/profile.");
-    else if (!u) why = t("The token needs a Balance URL: a new-api relay uses /api/user/self; a sub2api panel uses /api/v1/user/profile to read the account's balance.");
-    if (why) {
-      box.classList.add("warn");
-      box.append(el("span", "", why));
-      const site = origin(u) || origin(draft.chat || draft.anthropic || draft.responses || "");
-      if (!site) return;
-      // sub2api's /v1/usage has one account query beside it: its panel's
-      for (const to of (path === "/v1/usage" ? ["/api/v1/user/profile"] : ["/api/user/self", "/api/v1/user/profile"]).map((q) => site + q)) {
-        const use = el("button", "text action", t("Use {url}", { url: to }));
-        use.onclick = () => {
-          draft.balanceURL = to;
-          // An unrelated expression belongs to the user, so changing the
-          // endpoint must not overwrite it.
-          if (!(draft.balancePath || "").trim() || /total_(available|granted|used)|unlimited_quota|^\s*\$?remaining\s*$/.test(draft.balancePath)) draft.balancePath = balanceFieldOf(to);
-          const ed = box.closest(".editor");
-          const bal = ed?.querySelector(".bal-url");
-          const field = ed?.querySelector(".bal-path");
-          if (bal) bal.value = draft.balanceURL;
-          if (field) { field.value = draft.balancePath; field.placeholder = balanceFieldOf(draft.balanceURL); }
-          // the Balance URL's own fold, not the first one in the editor
-          if (bal) shown(bal);
-          box.refresh();
-        };
-        box.append(use);
-      }
-      return;
-    }
-    if (path === "/api/user/self" && !(draft.headers || []).some((h) => (h[0] || "").trim().toLowerCase() === "new-api-user" && (h[1] || "").trim())) {
-      box.append(el("span", "", t("A new-api relay also wants the header New-Api-User = your user ID (shown in the site's personal settings): add it under Headers.")));
-    }
-  };
-  box.refresh();
-  return box;
-}
-
 // accountQuota: an account's allowance as a line of small meters under its
 // name, the reset time on the ones nearly used up, credits and held resets.
 function accountQuota(data, user, capFor = () => 0, settable = null) {
@@ -15442,38 +15350,58 @@ function renderMove(p) {
 }
 
 async function providerAction(action, body, okMsg, base = "provider/") {
+  const was = editing, previous = draft;
+  const ownsEditor = () => editing === was && draft === previous;
   if (action === "delete" && !await confirmRemoval(providers?.providers.find((p) => p.id === body.id)?.name || body.id,
     "Its saved configuration will be removed. Agents using it may switch to another provider or their default model.")) return false;
   try {
-    const was = editing;
     providers = await api(base + action, body);
-    dropSigningIn(was); // saved or removed, the editor takes its sign-in with it
-    editing = null;
-    draft = null;
-    importing = null;
-    adding = false;
-    presetQuery = "";
+    if (ownsEditor()) {
+      dropSigningIn(was); // saved or removed, the editor takes its sign-in with it
+      await window.Sub2API?.cancelEditor(was);
+      if (ownsEditor()) {
+        editing = null;
+        draft = null;
+        importing = null;
+        adding = false;
+        presetQuery = "";
+      }
+    }
     renderProviders();
     state = await api("state");
     renderAgents();
     saidMoved(okMsg);
     return true;
   } catch (e) {
+    if (action === "save" && e.status === 409) {
+      // Keep the user's draft, but never replay it against the newer source.
+      if (ownsEditor() && draft) draft.saveRevisionConflict = true;
+      try { providers = await api("providers"); } catch { /* the conflict stays visible below */ }
+      renderProviders();
+      if (ownsEditor()) {
+        editorError(e.message, "err");
+        for (const b of document.querySelectorAll(".editor .busy")) doneSaving(b);
+      } else statusErr(e);
+      return false;
+    }
     // a Remove may have gone through before what failed: the list as it is
     // now, and the editor of a provider gone closes, rather than stay open
     // on it for a second Remove to say there is no such provider
-    if (action === "delete" && typeof editing === "string") {
+    if (action === "delete" && typeof was === "string") {
       try {
         providers = await api("providers");
-        if (!providers.providers.some((p) => p.id === editing)) {
-          editing = null; draft = null;
+        if (!providers.providers.some((p) => p.id === was)) {
+          if (ownsEditor()) {
+            await window.Sub2API?.cancelEditor(was);
+            if (ownsEditor()) { editing = null; draft = null; }
+          }
           renderProviders();
           return statusErr(e);
         }
       } catch { /* the error below says enough */ }
     }
-    if (!editorError(e.message, "err")) statusErr(e);
-    for (const b of document.querySelectorAll(".editor .busy")) doneSaving(b);
+    if (!ownsEditor() || !editorError(e.message, "err")) statusErr(e);
+    if (ownsEditor()) for (const b of document.querySelectorAll(".editor .busy")) doneSaving(b);
   }
 }
 

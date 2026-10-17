@@ -246,9 +246,23 @@ func keyCardProviders() []Provider {
 // is shown before this one reads them again after a restart.
 func keptKeyCards(ps []Provider) (plans, balances []SubscriptionQuota) {
 	plans, balances = []SubscriptionQuota{}, []SubscriptionQuota{}
+	panels := map[string]bool{}
 	for _, p := range ps {
+		if p.Sub2API != nil {
+			id := sub2apiBalanceID(p)
+			if !panels[id] {
+				if q, ok := lastReading(p.ID + "/" + keyTag("sub2api", id)); ok && q.Sub2API == p.Sub2API.Session {
+					q.Provider, q.Name, q.Icon, q.User = p.ID, p.Name, p.Icon, ""
+					balances = append(balances, q)
+					panels[id] = true
+				}
+			}
+		}
 		for _, ck := range cardKeys(p) {
 			for _, kind := range []string{"plan", "balance"} {
+				if kind == "balance" && p.Sub2API != nil {
+					continue // a panel balance belongs to the account query, not each key
+				}
 				q, ok := lastReading(p.ID + "/" + keyTag(kind, ck.key))
 				if !ok || !strings.EqualFold(q.User, ck.user) {
 					continue // kept under the name it had then
@@ -272,6 +286,9 @@ func keptKeyCards(ps []Provider) (plans, balances []SubscriptionQuota) {
 func withKeyReadings(cards []SubscriptionQuota, ps []Provider, kind string) []SubscriptionQuota {
 	out := slices.Clone(cards)
 	for _, p := range ps {
+		if kind == "balance" && p.Sub2API != nil {
+			continue // routing's key readings cannot authorize a panel balance
+		}
 		if !strings.HasPrefix(keyCardTag(p), kind+" ") {
 			continue // the key's windows are its other card's
 		}

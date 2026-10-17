@@ -27,6 +27,9 @@ func TestLaneLimitRoutes(t *testing.T) {
 	mux := http.NewServeMux()
 	providerRoutes(mux, nil)
 	post := func(action, body string) *httptest.ResponseRecorder {
+		if action == "save" {
+			body = currentProviderForm(t, body)
+		}
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/"+action, strings.NewReader(body)))
 		return w
@@ -132,6 +135,7 @@ func TestRPMSave(t *testing.T) {
 	mux := http.NewServeMux()
 	providerRoutes(mux, nil)
 	post := func(body string) *httptest.ResponseRecorder {
+		body = currentProviderForm(t, body)
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/save", strings.NewReader(body)))
 		return w

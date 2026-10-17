@@ -149,10 +149,13 @@ type providerJSON struct {
 	AccountNames map[string]string `json:"accountNames,omitempty"`
 	AccountSeats map[string]string `json:"accountSeats,omitempty"`
 	// where a custom provider's balance is asked (see provider.Balance)
-	BalanceURL    string `json:"balanceURL,omitempty"`
-	BalancePath   string `json:"balancePath,omitempty"`
-	BalanceMethod string `json:"balanceMethod,omitempty"`
-	ModelsURL     string `json:"modelsURL,omitempty"`
+	BalanceURL      string                   `json:"balanceURL,omitempty"`
+	BalancePath     string                   `json:"balancePath,omitempty"`
+	BalanceMethod   string                   `json:"balanceMethod,omitempty"`
+	Sub2API         *provider.Sub2APIBinding `json:"sub2api,omitempty"`
+	Sub2APIRevision string                   `json:"sub2apiRevision,omitempty"`
+	SaveRevision    string                   `json:"saveRevision"`
+	ModelsURL       string                   `json:"modelsURL,omitempty"`
 	// an account-wide balance token (provider.BalanceToken): whether the
 	// vendor takes one, and whether one is saved; never the token itself
 	BalanceToken struct {
@@ -636,6 +639,7 @@ func providerInfoWith(p provider.Provider, agents []agentUse, desktop map[string
 		Catalog: p.Catalog, Website: p.Website, KeysURL: p.KeysURL,
 		Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountNames: p.AccountNames, Headers: p.Headers, ExtraBody: p.ExtraBody, ReplyHeaders: p.ReplyHeaders, Searches: p.Searches, Cline: p.ClinePinnable(), PinUpstream: p.PinUpstream, Unredacted: p.Unredacted, InsecureTLS: p.InsecureTLS, TakesInsecureTLS: p.TakesInsecureTLS(), LimitRestOff: p.LimitRestOff, NativeCompaction: p.NativeCompaction, CarriesCompaction: p.CarriesCompaction(), PassUserAgent: p.PassUserAgent, OwnClient: p.OwnClient(), AuthHeader: p.AuthHeader, BothAuth: p.BothAuth(), BalanceURL: p.BalanceURL, BalancePath: p.BalancePath, BalanceMethod: p.BalanceMethod, ModelsURL: p.ModelsURL,
 		Ready: p.Ready(), Chosen: p.Picks(), Models: []modelJSON{}, Agents: []providerAgent{},
+		Sub2API: provider.Sub2APISafeBinding(p), Sub2APIRevision: provider.Sub2APIRevision(p), SaveRevision: p.SaveRevision,
 		Fallback: p.Fallback, Routing: p.Routing, Sink: p.Sink, Affinity: p.Affinity, KeepLogin: p.KeepLogin, KeepLoginAs: p.KeepLoginAs, SwitchOnly: p.SwitchOnly, CapStop: p.CapStop, CapCareful: p.CapCareful, Unlisted: p.Unlisted, NoModels: p.ServesNone(), BestInFamily: p.BestInFamily && len(p.Models) == 0 && !p.NoModels, Off: p.Off, Contexts: p.Contexts,
 		MaxConcurrency: p.MaxConcurrency, PluginConcurrency: p.PluginConcurrency(), PriceRate: p.PriceRate,
 		RateWindows: p.RateWindows, RateNow: rateNowOf(p, time.Now()),
@@ -1266,7 +1270,8 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			AccessKeyID    *string `json:"accessKeyID"`
 			ClearAccessKey bool    `json:"clearAccessKey"`
 			// From is the id the provider had: another is a rename
-			From string `json:"from"`
+			From         string `json:"from"`
+			SaveRevision string `json:"saveRevision"`
 			// CopyOf, with New, is the provider the new one is a copy of
 			// (#268): its key and what else the form doesn't carry are
 			// taken from it when left out
@@ -1793,7 +1798,7 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 					fail(rw, fmt.Errorf("%s can't carry Codex's native compaction: only a provider with a Responses API, a ChatGPT account or GitHub Copilot can", cmp.Or(in.Name, in.ID)))
 					return
 				}
-				if err := provider.Save(in); err != nil {
+				if err := provider.SaveWithRevision(in, req.SaveRevision); err != nil {
 					fail(rw, err)
 					return
 				}

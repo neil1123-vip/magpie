@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -67,10 +68,22 @@ func TestSaveAnswersBeforeTheAgentsSync(t *testing.T) {
 		return rec.Code, rec.Body.String()
 	}
 
+	saved, err := provider.Find("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerBody, err := json.Marshal(map[string]any{
+		"id": "a", "from": "a", "name": "A", "key": "ka",
+		"chat": "http://127.0.0.1:1/v1", "models": []string{"m1"}, "saveRevision": saved.SaveRevision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	syncAgentsOnChange()
 	for _, c := range []struct{ name, path, body string }{
 		{"group", "/api/groups/save", `{"id":"g1","from":"g1","name":"G1","members":["a/m1"]}`},
-		{"provider", "/api/provider/save", `{"id":"a","from":"a","name":"A","key":"ka","chat":"http://127.0.0.1:1/v1","models":["m1"]}`},
+		{"provider", "/api/provider/save", string(providerBody)},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			if err := syscall.Mkfifo(fifo, 0o600); err != nil {

@@ -64,8 +64,8 @@ func sharesAccountBalance(q SubscriptionQuota) bool {
 		len(q.BalanceParts) == 0 && balanceCurrencies(q.Balance) == nil
 }
 
-// sharedBalanceHist is the balances' history shareBalances goes by, read
-// before the cards' lock is taken; nil when none of cards is an account's
+// sharedBalanceHist is the balances' history shareBalances goes by;
+// nil when none of cards is an account's
 // balance, as then none is shared.
 func sharedBalanceHist(cards []SubscriptionQuota) balanceHist {
 	for _, q := range cards {
