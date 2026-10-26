@@ -309,6 +309,11 @@ const panelStart = 520
 // showMain opens the window immediately; otherwise only the tray icon appears.
 // link is a magpie:// link the app was started with, to confirm and import.
 func Run(version string, showMain bool, link string) error {
+	if runtime.GOOS == "windows" {
+		if err := startDesktopLog(version); err != nil {
+			log.Println("desktop log:", err)
+		}
+	}
 	Version = version
 	webkitDefaults()
 	// `make dev` runs the backend on its own, so a Go change restarts only
@@ -409,6 +414,7 @@ func Run(version string, showMain bool, link string) error {
 		// leaves both to it: the failover goes on through the new one, and
 		// so do the threads.
 		OnShutdown: func() {
+			log.Println("desktop: shutdown requested")
 			proc.EndProbes()
 			if handedOver.Load() {
 				return

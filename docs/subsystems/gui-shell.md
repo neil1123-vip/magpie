@@ -51,6 +51,36 @@ in separate child processes without displaying notifications.
 
 ## Constraints and failure behavior
 
+### Windows desktop diagnostics
+
+Before starting the Windows desktop backend, `Run` calls
+[`startDesktopLog`](../../internal/gui/desktop_log.go). Each launch keeps
+standard Go logs in its own `desktop-*.log` under `appdir.Cache()/logs`
+(`data/cache/logs` in portable mode), limited to 5 MiB plus one 5 MiB
+backup (`.log.1`). A longer write is truncated with a marker. Without a
+valid console, direct writes to `os.Stderr` pass through a pipe to the same
+bounded writer; their buffered tail can be lost on an abrupt process exit.
+Standard logging writes synchronously, including before Wails' fatal exits.
+
+Unhandled Go panics go directly to a separate `.crash` file, so log rotation
+cannot disconnect the runtime's crash output. Without a valid Windows
+standard error handle, that file becomes the OS standard error handle too:
+native exception tracebacks bypass Go's `os.Stderr` and can bypass
+`SetCrashOutput`. This uses one output path to avoid duplicate panic text.
+Its lifetime file lock keeps cleanup away from this process's files.
+At startup, cleanup removes inactive
+ordinary logs older than seven days, then the oldest logs above a 25 MiB
+history budget. It retains the three newest nonempty crash reports first;
+empty crash files do not displace them. Active processes and complete crash
+reports take priority over the budget, so it is not a hard directory limit.
+Only recognized desktop log files are cleaned. A requested shutdown is
+recorded before cleanup. Logging failures do not prevent the app starting,
+and logs stay local. `TestDesktopLog` checks direct exits and background
+panics after rotation in child processes without valid console streams;
+`TestDesktopNativeException` checks native exceptions and Go panics without
+an OS standard error handle. The writer and cleanup tests cover size, age,
+retention and active files.
+
 ### Provider-list ordering
 
 `api` in [`app.js`](../../internal/gui/assets/app.js) coordinates shared
