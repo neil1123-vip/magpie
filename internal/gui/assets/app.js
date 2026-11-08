@@ -9850,7 +9850,7 @@ function drawEditor(p, presetID) {
     advIn.append(...field(t("Context window"), contextPicks(p, cx), t("How long a request the models take, told to the agents; empty leaves it to the vendor and models.dev")));
     advIn.append(...outputField(p));
     advIn.append(...compactField(p));
-    if (p.carriesCompaction) advIn.append(...nativeCompactionField(() => true)[0]);
+    if (p.carriesCompaction) advIn.append(...nativeCompactionField(() => true, null, p.id)[0]);
     advIn.append(...field(t("Fallback"), renderFallback(p), fallbackHint(p)));
     const proxies = el("div", "stack");
     proxies.append(proxyPicker());
@@ -9911,9 +9911,11 @@ function drawEditor(p, presetID) {
       if (picked === false) return pickError();
       const body = { id: p.id, saveRevision: draft.saveRevision, models: chosenIds(), noModels: noneChosen(), bestInFamily: bestChosen(), unlisted: draft.unlisted, hiddenDrawers: draft.hiddenDrawers, hiddenVideomakers: draft.hiddenVideomakers, fallback: draft.fallback, contexts: cx.map, outputs: ox.map, compacts: cpx.map, maxImages, proxy, ...(own.changed ? { accountProxies: own.map } : {}), maxConcurrency, maxAccounts, ...queue, priceRate, rateWindows, modelPrefs: modelPrefsOfDraft(), pinUpstream: !!draft.pinUpstream, unredacted: !!draft.unredacted, countFree: !!draft.countFree, billing: draft.billing || "", ...(p.carriesCompaction ? { nativeCompaction: !!draft.nativeCompaction } : {}), ...routingOfDraft(p) };
       const sub = subOf(a.agent), options = { ...draft.pluginOptions };
+      const ownDraft = draft;
       saving(saveBtn, t("Saving…"));
       providerAction("save", body, t("{name} saved", { name: p.name }), "provider/",
-        () => saveAccountModelsDraft(picked).then(() => savePluginOptions(sub, options))); };
+        () => saveAccountModelsDraft(picked).then(() => savePluginOptions(sub, options)),
+        () => saveCompactionRecovery(ownDraft, body)); };
     bar.append(cancel, saveBtn);
     ed.append(bar);
     return ed;
@@ -10350,7 +10352,7 @@ function drawEditor(p, presetID) {
     if (!decideOnly(p || pr)) advIn.append(...outputField(p));
     if (!decideOnly(p || pr)) {
       advIn.append(...compactField(p));
-      const [row, refresh] = nativeCompactionField(carriesCompaction, testDraft);
+      const [row, refresh] = nativeCompactionField(carriesCompaction, testDraft, p?.id);
       advIn.append(...row);
       showCompaction = refresh;
     }
@@ -10601,7 +10603,9 @@ function drawEditor(p, presetID) {
     if (picked === false) return pickError();
     saving(saveBtn, t(isNew ? "Adding…" : "Saving…"));
     const okMsg = t(isNew ? "{name} added" : "{name} saved", { name: draft.name || draft.id });
-    providerAction("save", body, okMsg, "provider/", () => saveAccountModelsDraft(picked));
+    const ownDraft = draft;
+    providerAction("save", body, okMsg, "provider/", () => saveAccountModelsDraft(picked),
+      () => saveCompactionRecovery(ownDraft, body));
   };
   saveBtn.onclick = save;
   bar.append(cancel, saveBtn);
@@ -10693,20 +10697,16 @@ function outputField(p, at = el("span")) {
 
 // nativeCompactionField: Codex's own compaction on the provider (#1099),
 // where the wire carries it; show says when, for typed URLs
-function nativeCompactionField(show, probe) {
-  const [ntk, ncb] = tick(t("Codex compacts on this provider"), !!draft.nativeCompaction);
-  ntk.classList.add("native-compaction");
-  ncb.onchange = () => { draft.nativeCompaction = ncb.checked; };
-  const hint = el("div");
-  hint.append(
-    el("div", "", t("When on, Codex's compaction request and the provider's encrypted summary pass through unchanged. The conversation can continue only on the provider and account that made the summary; if unavailable, magpie returns an error without dropping the context.")),
-    el("div", "", t("When off, magpie generates a text summary. The conversation can then continue through magpie across accounts and providers.")),
-  );
-  const row = field(t("Compaction"), probe ? nativeTestField(ntk, "compaction", probe) : ntk, hint, t("A conversation compacted this way continues only on this provider and account."));
+function nativeCompactionField(show, probe, providerID) {
+  const form = draft, row = [el("div"), el("div")];
   const refresh = () => { for (const e of row) e.style.display = show() ? "" : "none"; };
+  import("./compaction-recovery.js").then((m) => m.mountCompaction(row, refresh, form, probe, providerID))
+    .catch((e) => row[1].append(el("div", "hint err", e.message)));
   refresh();
   return [row, refresh];
 }
+
+const saveCompactionRecovery = (...args) => import("./compaction-recovery.js").then((m) => m.saveRecovery(...args));
 
 function nativeTestField(control, kind, form) {
   const wrap = el("div", "detect native-test " + kind + "-test");
@@ -15849,14 +15849,20 @@ function renderMove(p) {
   return field(t("Runs on"), box, onPlugin ? t("magpie's built-in is retired, so this subscription stays on its plugin.") : t("If an account doesn't work through the plugin, nothing changes."));
 }
 
-async function providerAction(action, body, okMsg, base = "provider/", before) {
+async function providerAction(action, body, okMsg, base = "provider/", before, after) {
   const was = editing, previous = draft;
   const ownsEditor = () => editing === was && draft === previous;
+  let savedProvider = null;
   if (action === "delete" && !await confirmRemoval(providers?.providers.find((p) => p.id === body.id)?.name || body.id,
     "Its saved configuration will be removed. Agents using it may switch to another provider or their default model.")) return false;
   try {
     if (before) await before();
     providers = await api(base + action, body);
+    if (after) {
+      body.id = providers.savedID || body.id;
+      savedProvider = providers.providers?.find((p) => p.id === (body.id || slug(body.name || body.preset || "")));
+      await after();
+    }
     if (ownsEditor()) {
       dropSigningIn(was);
       await window.Sub2API?.cancelEditor(was);
@@ -15876,10 +15882,17 @@ async function providerAction(action, body, okMsg, base = "provider/", before) {
     saidMoved(providers.placed ? t("Saved at {region}: the key is that region's", { region: t(providers.placed) }) : okMsg);
     return true;
   } catch (e) {
+    if (savedProvider && ownsEditor()) {
+      // The provider saved; its local setting failed.
+      editing = savedProvider.id;
+      draft = { ...draftOf(savedProvider), localRecoveryEnabled: previous.localRecoveryEnabled };
+      renderProviders();
+      editorError(e.message, "err");
+      return false;
+    }
     if (action === "save" && e.status === 409) {
-      // Never replay a stale draft.
       if (ownsEditor() && draft) draft.saveRevisionConflict = true;
-      try { providers = await api("providers"); } catch { /* the conflict stays visible below */ }
+      try { providers = await api("providers"); } catch {}
       renderProviders();
       if (ownsEditor()) {
         editorError(e.message, "err");
@@ -15887,7 +15900,6 @@ async function providerAction(action, body, okMsg, base = "provider/", before) {
       } else statusErr(e);
       return false;
     }
-    // A failed Remove rereads state so an already removed provider's editor closes.
     if (action === "delete" && typeof was === "string") {
       try {
         providers = await api("providers");
@@ -15899,7 +15911,7 @@ async function providerAction(action, body, okMsg, base = "provider/", before) {
           renderProviders();
           return statusErr(e);
         }
-      } catch { /* the error below says enough */ }
+      } catch {}
     }
     if (!ownsEditor() || !editorError(e.message, "err")) statusErr(e);
     if (ownsEditor()) for (const b of document.querySelectorAll(".editor .busy")) doneSaving(b);

@@ -510,7 +510,9 @@ type Call struct {
 	Via   string    `json:"via,omitempty"` // the computer a remote magpie's request came from (AgentHeader)
 	// Kind: what the agent made the call for, when it isn't its turn —
 	// a Codex subagent's (callKind) — "" for a turn
-	Kind string `json:"kind,omitempty"`
+	Kind     string `json:"kind,omitempty"`
+	Recovery string `json:"recovery,omitempty"`
+	recovery *nativeRecovery
 	// For: the request a call of magpie's own (a web search) was made for
 	For *CallFor `json:"for,omitempty"`
 	// Masked: what masking swapped in it, nil for nothing
@@ -754,6 +756,10 @@ func (s *Server) record(c Call) {
 		c.Archive = c.wire.name
 		archive(c)
 		c.wire = nil
+	}
+	if c.recovery != nil {
+		c.recovery.calls = append(c.recovery.calls, c)
+		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2697,7 +2703,7 @@ func estimate(req *Request) int {
 }
 
 // serve routes one parsed-enough request to its provider.
-func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Protocol, body []byte) {
+func (s *Server) serveCore(w http.ResponseWriter, r *http.Request, from provider.Protocol, body []byte) {
 	start := time.Now()
 	// a client's "off" is magpie's none, for every route and check below
 	// that reads the body's effort (plugins#334)
@@ -2776,7 +2782,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	r = r.WithContext(withCodexPluginSubagent(r.Context(), codexPluginSubagent(cmp.Or(who.agent, agent), r.Header, body)))
 	var clientResponseID string // only a reply released to the client owns this ID
 	call := Call{Time: start, From: from, Model: unprefixed(modelOf(body)), Agent: who.agent, Via: who.via, Kind: requestCallKind(r.Header, metadata),
-		wire: archiving(r, capture, start, nil), headers: headerLogOf(r.Context())}
+		wire: archiving(r, capture, start, nil), headers: headerLogOf(r.Context()), recovery: nativeRecoveryOf(r)}
 	// an agent compacting its conversation is recorded as the compaction
 	// it is, as Codex's are by their header: Claude Code's compaction is a
 	// call its transcript never records (skipTranscript), so this row is
@@ -3421,7 +3427,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// trigger goes only where it can be asked as Codex sent it.
 	var checkpoint *checkpointWriter
 	if from == provider.Responses {
-		if cp, ok := checkpointOf(body); ok {
+		cp, hasCheckpoint, recoveryErr := recoveryCheckpoint(r, body)
+		if recoveryErr != nil {
+			writeError(w, from, 409, "Local recovery: "+recoveryErr.Error())
+			return
+		}
+		if hasCheckpoint {
 			checkpoint = &cp
 			kept, keptPl, left := checkpointReaders(cands, pl, cp)
 			if !left && compactionAside(call.Kind, asked) {
@@ -3441,6 +3452,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			}
 			cands, pl = kept, keptPl
 			if !left {
+				if recovery := nativeRecoveryOf(r); recovery != nil {
+					recovery.retry = true
+				}
 				call.Status, call.Error = 400, "native compaction sealed elsewhere"
 				writeError(w, from, 400, checkpointError(call.Model, cp))
 				turnedAway()
@@ -4157,8 +4171,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		hw.wantWhole = wantWhole && !pass
 		// a group member's reply that said nothing at all goes to the
 		// next member while one is left (emptyEnded, #6712); the last
-		// one's goes as it came
-		hw.emptyFails = isGroup && !last && !pass
+		// one's goes as it came. A native compaction may return only a checkpoint.
+		hw.emptyFails = isGroup && !last && !pass && !(from == provider.Responses && compactionTriggerIn(body))
 		// Claude's and GPT's reasoning is held for a refusal after it only
 		// while another candidate could answer instead: the last one's
 		// refusal isn't asked again, so holding it only kept a lone relay's
@@ -4243,7 +4257,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		var asking, asked, wrote atomic.Int64
 		var nt netTrace // where the try's time went (TryNet)
 		attemptBody := body
-		if from == provider.Responses {
+		if from == provider.Responses && !recoveryProtected(r) {
 			// what another sealed, which this one refused earlier in the
 			// conversation, isn't sent to be refused again; its own is
 			if b, ok := withoutRefused(stuck, c.vendor(), attemptBody); ok {
@@ -4276,7 +4290,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			}
 		}
 		// a middleware's onProvider changes what this provider is sent
+		beforeMiddleware := attemptBody
 		attemptBody = triedOn(r.Context(), c.p, c.model, attemptBody)
+		if recovery := nativeRecoveryOf(r); recovery != nil && recovery.compact {
+			recovery.changedInput = recoveryHistoryChanged(beforeMiddleware, attemptBody)
+		}
 		// the system prompt the user gave this model goes after the
 		// agent's own (model_system.go)
 		attemptBody = withModelSystem(r, c.p, c.model, from, attemptBody)
@@ -4723,6 +4741,16 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					defer release()
 					defer hw.watch()()
 					defer notePhase(ctx, "upstream")()
+					if err := s.prepareNativeRecovery(r, c, attemptBody); err != nil {
+						call.Status, call.Error = 409, err.Error()
+						if errors.Is(err, errRecoveryWindow) {
+							call.Status = 413
+						} else if recovery := nativeRecoveryOf(r); recovery != nil {
+							recovery.err = err
+						}
+						writeError(hw, from, call.Status, call.Error)
+						return
+					}
 					call.Status, call.Error = s.attempt(hw, r.WithContext(ctx), from, c.p, c.model, attemptBody, &call)
 				}()
 			}
@@ -4770,6 +4798,24 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			break
 		}
 		hw.settle()
+		if recovery := nativeRecoveryOf(r); recovery != nil {
+			if recovery.err != nil {
+				return
+			}
+			if recoveryProtected(r) && !hw.passing && hw.code() >= 400 &&
+				(foreignReasoning.Match(hw.errBody()) || hw.code() == 401 || hw.code() == 403 || hw.code() == 429 || hw.code() >= 500) {
+				recovery.retry = true
+				writeError(w, from, hw.code(), string(hw.errBody()))
+				return
+			}
+			if recovery.restored && recovery.capacity {
+				if !last {
+					continue
+				}
+				writeError(w, from, 413, call.Error)
+				return
+			}
+		}
 		if hw.handedOver {
 			// its refusal came after its reasoning went to the agent: the
 			// next try's stream follows it as the same reply
@@ -4995,7 +5041,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				continue
 			}
 		}
-		if resealed < 2 && from == provider.Responses && !hw.passing && hw.code() >= 400 && foreignReasoning.Match(hw.errBody()) {
+		if resealed < 2 && from == provider.Responses && !recoveryProtected(r) && !hw.passing && hw.code() >= 400 && foreignReasoning.Match(hw.errBody()) {
 			// the conversation moved here from another account or vendor,
 			// whose seals this one can't read: asked again without them
 			// (its reasoning, and each message's, call's and web search's
@@ -5797,7 +5843,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		// the body is read for why last, once the try is known to have
 		// failed: a reply held whole that passed is the whole reply, and
 		// failure over a 24MB one held its client past its timeout
-		if last && len(small) > 0 && pin == "" && other == nil && hw.failed() && !hw.passing && !hw.turnedAway && !hw.refused && !outgrew &&
+		if last && len(small) > 0 && (nativeRecoveryOf(r) == nil || !nativeRecoveryOf(r).restored) && pin == "" && other == nil && hw.failed() && !hw.passing && !hw.turnedAway && !hw.refused && !outgrew &&
 			(try.Fail == failQuota || try.Fail == failCredit || slices.Contains([]string{failQuota, failCredit}, failure(hw.code(), hw.errBody()))) {
 			// every one with room is out of its allowance: those roomy
 			// left out as too small for the request are asked after all,
@@ -6690,6 +6736,9 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 		}
 		path, body = at, b
 	}
+	if err := recoveryWireCheck(ctx, to, body); err != nil {
+		return nil, err
+	}
 	base := p.Base(to)
 	zenFree := p.IsOpenCode() && p.OpenCodeFree(gjson.GetBytes(body, "model").String())
 	if zenFree {
@@ -6868,6 +6917,7 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 	if v := codexTurnStateOf(in, turnAcct, turnOf); v != "" {
 		req.Header.Set("X-Codex-Turn-State", v)
 	}
+	req.Header.Del("X-Magpie-Recovery-Token")
 	// a sign-in its vendor revoked isn't sent again: the next member is
 	// asked, and the agent told to sign in again (#1793)
 	if why, ok := provider.RevokedSignIn(p.Account, req); ok {
@@ -6893,6 +6943,9 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 	// a request asked again in the same ask (RetryOneAuth and the others
 	// below) goes on the wire again too, as long as it went
 	again := func(r *http.Request) (*http.Response, error) {
+		if err := recoveryWireCheck(ctx, to, body); err != nil {
+			return nil, err
+		}
 		n := sent
 		if r.ContentLength > 0 {
 			n = int(r.ContentLength)
@@ -7418,7 +7471,9 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	// them where they were made, when that was another provider or key
 	asSent, sentWhole, delta := body, body, false
 	var remote *remoteTurn
-	if proto == provider.Responses {
+	recovery := nativeRecoveryOf(r)
+	wholeRecovery := recovery != nil && (recovery.restored || recovery.pending != nil)
+	if proto == provider.Responses && !wholeRecovery {
 		sentWhole = prevElsewhere(r, p, body, false)
 		if body, delta = prevDelta(r, p, body); !delta {
 			body = sentWhole
@@ -7454,7 +7509,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 			}
 		}
 	}
-	if (delta || proto == provider.Responses && (prevHeld(r) || prevClientWhole(r))) && (badRequest(res.StatusCode) || res.StatusCode == http.StatusNotFound) {
+	if !wholeRecovery && (delta || proto == provider.Responses && (prevHeld(r) || prevClientWhole(r))) && (badRequest(res.StatusCode) || res.StatusCode == http.StatusNotFound) {
 		// one it no longer holds: the conversation whole; and one another
 		// of its resources made (prevForeign): the whole, with the items
 		// magpie brought back naming nothing — or, for a conversation the

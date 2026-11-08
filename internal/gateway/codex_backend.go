@@ -29,6 +29,7 @@ import (
 	"github.com/yetone/magpie/internal/codexsummary"
 	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/recoverystore"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/usage"
 )
@@ -996,15 +997,40 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 	if _, err := keySlot(r.Context()); err != nil {
 		return
 	}
+	if r.Method == http.MethodPost && rest == "/responses" {
+		s.withNativeRecovery(w, r, body, func(w http.ResponseWriter, r *http.Request, body []byte) {
+			if state := nativeRecoveryOf(r); state != nil && state.restored {
+				base := provider.CodexBase
+				if apiKey(r.Header) {
+					base = codexAPIBase
+				}
+				if _, known := codexRelayedAccount(base, r.Header, on); !known {
+					writeError(w, provider.Responses, http.StatusConflict, "local history cannot be restored through an unknown Codex account; select an account configured in Magpie")
+					return
+				}
+				model := modelOf(body)
+				if !strings.Contains(model, "/") {
+					model = "codex/" + model
+				}
+				// Hooks already ran in codexBackend. The restored history gets
+				// routing's current account, key, pin and fallback checks.
+				s.serve(w, r, provider.Responses, rewriteModel(body, model))
+				return
+			}
+			s.codexUpstreamOnRecovery(w, r, rest, body, on)
+		})
+		return
+	}
+	s.codexUpstreamOnRecovery(w, r, rest, body, on)
+}
+
+func (s *Server) codexUpstreamOnRecovery(w http.ResponseWriter, r *http.Request, rest string, body []byte, on *provider.Provider) {
 	start := time.Now()
 	usage.Saw(agentOf(r))
 	// Codex's own turns come here from the mux, not through serve: the
 	// row written below sums this call's tries in its own context (#4456)
 	r = r.WithContext(s.countBytes(r.Context()))
 	w0, body0 := w, body // as they came, for the fallbacks (codexFallBack)
-	// Claude's blocks magpie gave Codex (claudeseal) are Claude's alone:
-	// to OpenAI each item is its summary, as before magpie carried them
-	body = withoutClaudeSeals(body)
 	base := provider.CodexBase
 	if apiKey(r.Header) && rest != "/models" {
 		base = codexAPIBase
@@ -1028,6 +1054,19 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 			return
 		}
 	}
+	if r.Method == http.MethodPost && rest == "/responses" {
+		if err := s.prepareCodexRecovery(r, base, on, body0); err != nil {
+			status := http.StatusConflict
+			if errors.Is(err, errRecoveryWindow) {
+				status = http.StatusRequestEntityTooLarge
+			}
+			writeError(w, provider.Responses, status, err.Error())
+			return
+		}
+	}
+	// Claude's blocks magpie gave Codex (claudeseal) are Claude's alone:
+	// to OpenAI each item is its summary, as before magpie carried them
+	body = withoutClaudeSeals(body)
 	var maskedHits maskHits
 	// the ChatGPT sign-in the user set to go unmasked, and its fallbacks
 	// (codexFallBack masks for its own route), gets the turn as written
@@ -1293,6 +1332,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 				return
 			}
 			copyHeaders(req.Header, r.Header)
+			req.Header.Del("X-Magpie-Recovery-Token")
 			if on != nil {
 				// the account's own token and id in place of the sign-in's;
 				// what Codex said it takes back stays as it said it
@@ -1316,6 +1356,15 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 			}
 			// left to the transport, the reply comes back plain for the usage in it
 			req.Header.Del("Accept-Encoding")
+			if err := recoveryWireCheck(req.Context(), provider.Responses, body); err != nil {
+				status := http.StatusConflict
+				if errors.Is(err, errRecoveryWindow) {
+					status = http.StatusRequestEntityTooLarge
+				}
+				writeError(w, provider.Responses, status, err.Error())
+				end(status, err.Error(), 0, 0)
+				return
+			}
 			// a turn to ChatGPT goes zstd-compressed again, as Codex sent it
 			// before magpie read it (ylorn on X); an API key's goes plain
 			sent = provider.CodexCompressed(req, body)
@@ -1356,6 +1405,11 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 					// asking again on them below (heardCodexCredits)
 					heardCodexCredits(acct, res.Header)
 				}
+			}
+			if state := nativeRecoveryOf(r); state != nil {
+				// A later reply supersedes failures retried within this turn.
+				state.retry = len(sealedCompactions(body)) > 0 &&
+					(res.StatusCode == 401 || res.StatusCode == 403 || res.StatusCode == 429 || res.StatusCode >= 500)
 			}
 			if !creditsAsked && rest == "/responses" && base != codexAPIBase && res.StatusCode == http.StatusTooManyRequests && relayOnCredits(on) {
 				// the account holds credits and was refused as out of its
@@ -1423,18 +1477,38 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 			if rest != "/responses" || tries >= 3 || (res.StatusCode != 400 && res.StatusCode != 404) {
 				break
 			}
-			// an item OpenAI can't take — sealed by another account, or
-			// another vendor's that it looks up and doesn't have — is taken
-			// out and the rest asked again, rather than the conversation
-			// stuck on it for good
 			msg, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 			res.Body.Close()
 			res.Body = io.NopCloser(bytes.NewReader(msg))
-			b, ok := withoutUnreadable(body, msg)
+			var b []byte
+			var ok bool
+			if len(sealedCompactions(body)) > 0 || compactionTriggerIn(body) {
+				// Attribution fields can be removed, but never the checkpoint
+				// or history it replaces. Only exact local recovery may do that.
+				if field, metadata := refusedPassthrough(msg); metadata {
+					b, ok = withoutPassthrough(body, field)
+				} else {
+					if state := nativeRecoveryOf(r); state != nil && foreignReasoning.Match(msg) {
+						state.retry = true
+					}
+					break
+				}
+			} else {
+				b, ok = withoutUnreadable(body, msg)
+			}
 			if !ok {
 				break
 			}
 			body = b
+			if err := s.prepareCodexRecovery(r, base, on, body); err != nil {
+				status := http.StatusConflict
+				if errors.Is(err, errRecoveryWindow) {
+					status = http.StatusRequestEntityTooLarge
+				}
+				writeError(w, provider.Responses, status, err.Error())
+				end(status, err.Error(), 0, 0)
+				return
+			}
 		}
 		if rest == "/images/generations" || rest == "/images/edits" {
 			if acct, ok := codexRelayedAccount(base, r.Header, on); ok {
@@ -1521,7 +1595,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 		// come, an error before them held for the turn to be asked again
 		out := w
 		var hw *holdWriter
-		if overload && streams && (busyAgain < lastRetries || kept.sent || s.codexFallsBack(r, body)) {
+		if streams && (overload && (busyAgain < lastRetries || kept.sent || s.codexFallsBack(r, body)) || nativeRecoveryOf(r) != nil && len(sealedCompactions(body)) > 0) {
 			hw = newHoldWriter(w, true)
 			hw.alive, hw.streams, hw.ctx, hw.stop = kept, true, r.Context(), cancel
 			// reasoning goes to Codex at once, as it always went
@@ -1592,6 +1666,18 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 			break
 		}
 		hw.settle()
+		if state := nativeRecoveryOf(r); state != nil && hw.mayAskAgain() && len(sealedCompactions(body)) > 0 &&
+			(foreignReasoning.Match(hw.errBody()) || hw.code() == 401 || hw.code() == 403 || hw.code() == 429 || hw.code() >= 500) {
+			state.retry = true
+			status := hw.code()
+			if status < 400 {
+				status = http.StatusBadRequest
+			}
+			said := provider.APIError(hw.errBody(), "native compaction was refused")
+			writeError(w, provider.Responses, status, said)
+			end(status, said, 0, 0)
+			return
+		}
 		if hw.mayAskAgain() && hw.failure != 0 && !hw.refused && codexBusy(hw.failure, hw.errBody()) && r.Context().Err() == nil {
 			// the backend too busy for the turn, said on its stream before
 			// any of the reply (#1418)
@@ -1629,7 +1715,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 	}
 	call := Call{Time: start, From: provider.Responses, To: provider.Responses, Model: modelOf(body),
 		Provider: "openai", Agent: callerOf(r).agent, Kind: kind, Status: res.StatusCode,
-		Millis: time.Since(start).Milliseconds(), Fallback: resetNote, headers: headerLogOf(r.Context())}
+		Millis: time.Since(start).Milliseconds(), Fallback: resetNote, headers: headerLogOf(r.Context()), recovery: nativeRecoveryOf(r)}
 	if len(tried) > 0 {
 		// the overloads it was asked again for, before the one that answered
 		call.Fallback = strings.Join(append(tried, call.Fallback), "; ")
@@ -2263,6 +2349,30 @@ func threadSource(meta string) string {
 	default:
 		return s
 	}
+}
+
+func (s *Server) prepareCodexRecovery(r *http.Request, base string, on *provider.Provider, body []byte) error {
+	if acct, ok := codexRelayedAccount(base, r.Header, on); ok {
+		return s.prepareNativeRecovery(r, candidate{p: acct, model: modelOf(body)}, body)
+	}
+	state := nativeRecoveryOf(r)
+	if state == nil {
+		return nil
+	}
+	if state.restored {
+		return fmt.Errorf("local history cannot be restored through an unknown Codex account; select an account configured in Magpie")
+	}
+	if !compactionTriggerIn(body) {
+		return nil
+	}
+	enabled, err := recoverystore.Enabled("codex")
+	if err != nil {
+		return err
+	}
+	if enabled {
+		return fmt.Errorf("local recovery cannot save this compaction because the Codex account is not known to Magpie")
+	}
+	return nil
 }
 
 func copyHeaders(dst, src http.Header) {

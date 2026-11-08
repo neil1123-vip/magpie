@@ -16,9 +16,11 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/codexcat"
 	"github.com/yetone/magpie/internal/gwmw"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/recoverystore"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/usage"
 )
@@ -407,8 +409,8 @@ func TestCodexOwnModelOmitsNonemptyReasoning(t *testing.T) {
 
 // Back on one of Codex's own models after another vendor's: its reasoning,
 // an id with nothing sealed in it, would be looked up by OpenAI and not
-// found, so it doesn't go. An item OpenAI still refuses is taken out and
-// the rest asked again.
+// found, so it doesn't go. A refused compaction holds conversation history
+// and must not be removed merely to turn the refusal into a successful reply.
 func TestCodexOwnModelAfterAnotherVendor(t *testing.T) {
 	setup(t, provider.Chat, &fake{t: t})
 	var got [][]byte
@@ -433,16 +435,348 @@ func TestCodexOwnModelAfterAnotherVendor(t *testing.T) {
 	  {"type":"compaction","id":"cmp_0217abc","encrypted_content":"not-openai"},
 	  {"type":"reasoning","id":"rs_own","summary":[],"encrypted_content":"openai-own"},
 	  {"type":"message","role":"user","content":[{"type":"input_text","text":"go on"}]}]}`)
-	if code != 200 || !strings.Contains(body, `response.completed`) {
+	if code != 400 || !strings.Contains(body, `could not be verified`) {
 		t.Fatalf("%d %s", code, body)
 	}
-	if len(got) != 3 || bytes.Contains(got[0], []byte("volc thought")) {
-		t.Fatalf("%d asks, first: %s", len(got), got[0])
+	if len(got) != 1 || bytes.Contains(got[0], []byte("volc thought")) {
+		t.Fatalf("%d asks: %q", len(got), got)
 	}
-	last := string(got[2])
-	if strings.Contains(last, "cmp_0217abc") || strings.Contains(last, "rs_other") ||
+	last := string(got[0])
+	if !strings.Contains(last, "cmp_0217abc") || !strings.Contains(last, "rs_other") ||
 		!strings.Contains(last, "openai-own") || !strings.Contains(last, "go on") {
 		t.Errorf("last ask: %s", last)
+	}
+}
+
+func TestCodexOwnModelStillDropsUnreadableReasoning(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	var got [][]byte
+	chatgpt(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = append(got, b)
+		if bytes.Contains(b, []byte("rs_other")) {
+			w.WriteHeader(404)
+			io.WriteString(w, `{"error":{"message":"Item with id 'rs_other' not found"}}`)
+			return
+		}
+		io.WriteString(w, sse(`data: {"type":"response.completed","response":{"id":"r1","status":"completed"}}`))
+	})
+	code, body := codexPost(t, `{"model":"gpt-6-luna","stream":true,"input":[{"type":"reasoning","id":"rs_other","summary":[],"encrypted_content":"private"},{"role":"user","content":"continue"}]}`)
+	if code != 200 || len(got) != 2 || !strings.Contains(body, "response.completed") || bytes.Contains(got[1], []byte("rs_other")) {
+		t.Fatalf("reasoning recovery: %d %s; %q", code, body, got)
+	}
+}
+
+func TestCodexDirectRecoveryRequiresKnownAccount(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	asks := 0
+	chatgpt(t, func(w http.ResponseWriter, r *http.Request) {
+		asks++
+		io.WriteString(w, nativeSealedReply("unknown-account-seal"))
+	})
+	enabled := true
+	if err := recoverystore.Configure("codex", &enabled, nil); err != nil {
+		t.Fatal(err)
+	}
+	code, body := codexPost(t, strings.Replace(compactTurn, "%s", "gpt-6-sol", 1))
+	if code != 409 || asks != 0 || !strings.Contains(body, "account is not known") {
+		t.Fatalf("unknown compaction: %d %s; asks %d", code, body, asks)
+	}
+}
+
+func TestCodexDirectCompactionStillRepairsRefusedMetadata(t *testing.T) {
+	for _, item := range []string{`{"type":"compaction_trigger"}`, `{"type":"compaction","encrypted_content":"kept-seal"}`} {
+		t.Run(item, func(t *testing.T) {
+			setup(t, provider.Chat, &fake{t: t})
+			var got [][]byte
+			chatgpt(t, func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				got = append(got, body)
+				if passthroughHas(body, "content_token_count") {
+					w.WriteHeader(http.StatusBadRequest)
+					io.WriteString(w, passthroughRefusalBody)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				io.WriteString(w, nativeSealedReply("metadata-repaired-seal"))
+			})
+			body := strings.Replace(passthroughTurn, "%s", "gpt-6-sol", 1)
+			body = strings.Replace(body, `"stream":false`, `"stream":true`, 1)
+			body = strings.TrimSuffix(body, `]}`) + `,` + item + `]}`
+			code, response := codexPost(t, body)
+			if code != 200 || len(got) != 2 || passthroughHas(got[1], "content_token_count") || !bytes.Contains(got[1], []byte(item)) || !bytes.Contains(got[1], []byte("again")) {
+				t.Fatalf("metadata repair: %d %s; requests %q", code, response, got)
+			}
+		})
+	}
+}
+
+func TestCodexDirectCompactionCommitsRecoveryCopy(t *testing.T) {
+	codexSignedIn(t)
+	asks := 0
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asks++
+		io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, nativeSealedReply("direct-saved-seal"))
+	}))
+	t.Cleanup(up.Close)
+	old := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	t.Cleanup(func() { provider.CodexBase = old })
+	enabled := true
+	if err := recoverystore.Configure("codex", &enabled, nil); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, CodexPath+"/responses", strings.NewReader(strings.Replace(compactTurn, "%s", "gpt-6-sol", 1)))
+	req.RemoteAddr = "127.0.0.1:4500"
+	req.Header.Set("Authorization", "Bearer chatgpt-token")
+	req.Header.Set("chatgpt-account-id", "acct-1")
+	s := New()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 || asks != 1 || rec.Header().Get("X-Magpie-Recovery-State") != "native-backed" {
+		t.Fatalf("direct compact: %d %s; asks %d, headers %v", rec.Code, rec.Body.String(), asks, rec.Header())
+	}
+	record, err := recoverystore.Load("local", checkpointKey("direct-saved-seal"))
+	if err != nil || record.Provider != "codex" || record.Writer == "" || !bytes.Contains(record.Input, []byte("fix the bug")) || bytes.Contains(record.Input, []byte("compaction_trigger")) {
+		t.Fatalf("saved record: %+v, %v", record, err)
+	}
+	if calls := s.Recent(); len(calls) != 1 || calls[0].Recovery != "native-backed" {
+		t.Fatalf("compaction recovery state: %+v", calls)
+	}
+}
+
+func TestCodexDirectCompactionCommitsAfterRetry(t *testing.T) {
+	for _, window := range []int{272000, 16000} {
+		t.Run(strconv.Itoa(window), func(t *testing.T) {
+			codexSignedIn(t)
+			if err := provider.Save(provider.Provider{ID: "codex", NativeCompaction: true, Contexts: map[string]int{"gpt-6-sol": window}}); err != nil {
+				t.Fatal(err)
+			}
+			enabled := true
+			if err := recoverystore.Configure("codex", &enabled, nil); err != nil {
+				t.Fatal(err)
+			}
+			original := strings.Repeat("original history ", 1500)
+			input, _ := json.Marshal([]map[string]string{{"role": "user", "content": original}})
+			record := recoverystore.Record{Scope: "local", Provider: "codex", Writer: "codex:me@example.com", Model: "gpt-6-sol",
+				Hash: checkpointKey("retry-old-seal"), Input: input, Output: json.RawMessage(`[{"type":"compaction","encrypted_content":"retry-old-seal"}]`)}
+			pending, err := recoverystore.Begin(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := pending.Commit(record); err != nil {
+				t.Fatal(err)
+			}
+			var mu sync.Mutex
+			asks := 0
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.Copy(io.Discard, r.Body)
+				mu.Lock()
+				asks++
+				attempt := asks
+				mu.Unlock()
+				if attempt == 1 {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					io.WriteString(w, `{"error":{"code":"server_is_overloaded","message":"server is overloaded"}}`)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				io.WriteString(w, nativeSealedReply("retry-new-seal"))
+			}))
+			t.Cleanup(up.Close)
+			oldBase, oldPause := provider.CodexBase, retryPause
+			provider.CodexBase, retryPause = up.URL+"/backend-api/codex", time.Millisecond
+			t.Cleanup(func() { provider.CodexBase, retryPause = oldBase, oldPause })
+			body := `{"model":"gpt-6-sol","stream":true,"input":[{"type":"compaction","encrypted_content":"retry-old-seal"},{"role":"user","content":"latest input"},{"type":"compaction_trigger"}]}`
+			req := httptest.NewRequest(http.MethodPost, CodexPath+"/responses", strings.NewReader(body))
+			req.RemoteAddr = "127.0.0.1:4500"
+			req.Header.Set("Authorization", "Bearer chatgpt-token")
+			req.Header.Set("chatgpt-account-id", "acct-1")
+			rec := httptest.NewRecorder()
+			New().Handler().ServeHTTP(rec, req)
+			mu.Lock()
+			count := asks
+			mu.Unlock()
+			if rec.Code != 200 || count != 2 || rec.Header().Get("X-Magpie-Recovery-State") != "native-backed" || !strings.Contains(rec.Body.String(), "retry-new-seal") {
+				t.Fatalf("successful retry was not published: %d %s; asks %d, headers %v", rec.Code, rec.Body.String(), count, rec.Header())
+			}
+			saved, err := recoverystore.Load("local", checkpointKey("retry-new-seal"))
+			if err != nil || !bytes.Contains(saved.Input, []byte(original)) || !bytes.Contains(saved.Input, []byte("latest input")) {
+				t.Fatalf("successful retry was not saved: %v; input bytes %d", err, len(saved.Input))
+			}
+		})
+	}
+}
+
+func TestCodexDirectRestoresAfterStreamRejectsSeal(t *testing.T) {
+	for _, name := range []string{"unanswered", "after_output"} {
+		t.Run(name, func(t *testing.T) {
+			codexSignedIn(t)
+			if err := catalog.SaveLive("codex", provider.CodexBase, []catalog.Model{{ID: "gpt-6-sol", Context: 272000, Output: 64000}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := provider.Save(provider.Provider{ID: "codex", Contexts: map[string]int{"gpt-6-sol": 272000}}); err != nil {
+				t.Fatal(err)
+			}
+			var got [][]byte
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				got = append(got, b)
+				w.Header().Set("Content-Type", "text/event-stream")
+				switch {
+				case bytes.Contains(b, []byte("compaction_trigger")):
+					io.WriteString(w, nativeSealedReply("direct-refused-seal"))
+				case bytes.Contains(b, []byte("direct-refused-seal")):
+					if name == "after_output" {
+						io.WriteString(w, sse(`data: {"type":"response.output_text.delta","delta":"already visible"}`))
+						w.(http.Flusher).Flush()
+					}
+					io.WriteString(w, sse(`data: {"type":"response.failed","response":{"id":"refused","status":"failed","error":{"code":"invalid_encrypted_content","message":"The encrypted content could not be verified"}}}`))
+				default:
+					io.WriteString(w, sse(
+						`data: {"type":"response.output_text.delta","delta":"continued"}`,
+						`data: {"type":"response.completed","response":{"id":"continued","status":"completed","output":[],"usage":{"input_tokens":5,"output_tokens":1}}}`))
+				}
+			}))
+			t.Cleanup(up.Close)
+			old := provider.CodexBase
+			provider.CodexBase = up.URL + "/backend-api/codex"
+			t.Cleanup(func() { provider.CodexBase = old })
+			enabled := true
+			if err := recoverystore.Configure("codex", &enabled, nil); err != nil {
+				t.Fatal(err)
+			}
+			s := New()
+			ask := func(body string) *httptest.ResponseRecorder {
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodPost, CodexPath+"/responses", strings.NewReader(body))
+				req.RemoteAddr = "127.0.0.1:4500"
+				req.Header.Set("Authorization", "Bearer chatgpt-token")
+				req.Header.Set("chatgpt-account-id", "acct-1")
+				s.Handler().ServeHTTP(rec, req)
+				return rec
+			}
+			if rec := ask(strings.Replace(compactTurn, "%s", "gpt-6-sol", 1)); rec.Code != 200 {
+				t.Fatalf("compact: %d %s", rec.Code, rec.Body.String())
+			}
+			rec := ask(`{"model":"gpt-6-sol","stream":true,"input":[{"type":"compaction","encrypted_content":"direct-refused-seal"},{"role":"user","content":"continue"}]}`)
+			if name == "after_output" {
+				if rec.Code != 200 || len(got) != 2 || !strings.Contains(rec.Body.String(), "already visible") || !strings.Contains(rec.Body.String(), "response.failed") || strings.Contains(rec.Body.String(), "continued") {
+					t.Fatalf("retried after visible output: %d %s; asks %d", rec.Code, rec.Body.String(), len(got))
+				}
+				return
+			}
+			if rec.Code != 200 || len(got) != 3 || !strings.Contains(rec.Body.String(), "continued") || strings.Contains(rec.Body.String(), "response.failed") {
+				t.Fatalf("recovery: %d %s; asks %d", rec.Code, rec.Body.String(), len(got))
+			}
+			if !bytes.Contains(got[2], []byte("fix the bug")) || !bytes.Contains(got[2], []byte("continue")) || bytes.Contains(got[2], []byte("direct-refused-seal")) {
+				t.Fatalf("restored request: %s", got[2])
+			}
+			calls := s.Recent()
+			if len(calls) == 0 || calls[0].Recovery != "replayed-this-request" {
+				t.Fatalf("restored recovery state: %+v", calls)
+			}
+		})
+	}
+}
+
+func TestCodexDirectRecoveryTokenStaysLocal(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	asks := 0
+	chatgpt(t, func(w http.ResponseWriter, r *http.Request) {
+		asks++
+		if token := r.Header.Get("X-Magpie-Recovery-Token"); token != "" {
+			t.Errorf("local authorization token reached upstream: %q", token)
+		}
+		io.WriteString(w, sse(`data: {"type":"response.completed","response":{"id":"r1","status":"completed"}}`))
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, CodexPath+"/responses", strings.NewReader(`{"model":"gpt-6-sol","stream":true,"input":"hello"}`))
+	req.Header.Set("Authorization", "Bearer chatgpt-token")
+	req.Header.Set("chatgpt-account-id", "acct-1")
+	req.Header.Set("X-Magpie-Recovery-Token", "local-choice-token")
+	New().Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 || asks != 1 {
+		t.Fatalf("normal turn: %d %s; asks %d", rec.Code, rec.Body.String(), asks)
+	}
+}
+
+func TestCodexDirectRecoveryRoutesAfterAccountStops(t *testing.T) {
+	for _, pin := range []string{"", "me@example.com"} {
+		t.Run("pin="+pin, func(t *testing.T) {
+			codexSignedIn(t, "spare@example.com")
+			if err := catalog.SaveLive("codex", provider.CodexBase, []catalog.Model{{ID: "gpt-6-sol", Context: 272000, Output: 64000}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := provider.SetLoginOn("codex", "spare@example.com", false); err != nil {
+				t.Fatal(err)
+			}
+			if err := provider.Save(provider.Provider{ID: "codex", Contexts: map[string]int{"gpt-6-sol": 272000}}); err != nil {
+				t.Fatal(err)
+			}
+			var accounts []string
+			var restored []byte
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				account := r.Header.Get("chatgpt-account-id")
+				accounts = append(accounts, account)
+				w.Header().Set("Content-Type", "text/event-stream")
+				if bytes.Contains(b, []byte("compaction_trigger")) {
+					io.WriteString(w, nativeSealedReply("direct-stopped-account"))
+					return
+				}
+				if account == "acct-1" {
+					if err := provider.SetLoginOn("codex", "spare@example.com", true); err != nil {
+						t.Error(err)
+					}
+					if err := provider.SetLoginOn("codex", "me@example.com", false); err != nil {
+						t.Error(err)
+					}
+					w.WriteHeader(http.StatusUnauthorized)
+					io.WriteString(w, `{"error":{"message":"original account is unavailable","code":"invalid_api_key"}}`)
+					return
+				}
+				restored = b
+				io.WriteString(w, sse(
+					`data: {"type":"response.output_text.delta","delta":"continued"}`,
+					`data: {"type":"response.completed","response":{"id":"continued","status":"completed","output":[],"usage":{"input_tokens":5,"output_tokens":1}}}`))
+			}))
+			t.Cleanup(up.Close)
+			old := provider.CodexBase
+			provider.CodexBase = up.URL + "/backend-api/codex"
+			t.Cleanup(func() { provider.CodexBase = old })
+			enabled := true
+			if err := recoverystore.Configure("codex", &enabled, nil); err != nil {
+				t.Fatal(err)
+			}
+			s := New()
+			ask := func(body, account string) *httptest.ResponseRecorder {
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodPost, CodexPath+"/responses", strings.NewReader(body))
+				req.RemoteAddr = "127.0.0.1:4500"
+				req.Header.Set("Authorization", "Bearer chatgpt-token")
+				req.Header.Set("chatgpt-account-id", "acct-1")
+				req.Header.Set(AccountHeader, account)
+				s.Handler().ServeHTTP(rec, req)
+				return rec
+			}
+			if rec := ask(strings.Replace(compactTurn, "%s", "gpt-6-sol", 1), ""); rec.Code != 200 {
+				t.Fatalf("compact: %d %s", rec.Code, rec.Body.String())
+			}
+			rec := ask(`{"model":"gpt-6-sol","stream":true,"input":[{"type":"compaction","encrypted_content":"direct-stopped-account"},{"role":"user","content":"continue"}]}`, pin)
+			if pin != "" {
+				if bytes.Contains(restored, []byte("fix the bug")) || strings.Contains(strings.Join(accounts, ","), "acct-2") || rec.Code < 400 {
+					t.Fatalf("fixed account was bypassed: %d %s; accounts %v, restored %s", rec.Code, rec.Body.String(), accounts, restored)
+				}
+				return
+			}
+			if rec.Code != 200 || strings.Join(accounts, ",") != "acct-1,acct-1,acct-2" || !bytes.Contains(restored, []byte("fix the bug")) || !bytes.Contains(restored, []byte("continue")) || bytes.Contains(restored, []byte("direct-stopped-account")) {
+				t.Fatalf("recovery did not reroute: %d %s; accounts %v, restored %s", rec.Code, rec.Body.String(), accounts, restored)
+			}
+		})
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/filememo"
+	"github.com/yetone/magpie/internal/recoverystore"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -66,6 +67,11 @@ func Rename(from, to string) error {
 	if slices.ContainsFunc(f.Providers, func(p Provider) bool { return p.ID == to }) {
 		return fmt.Errorf("there is a provider %q already", to)
 	}
+	unlock, err := recoverystore.GuardProviderRename(from, to)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	// an id another provider once had is this one's now; the calls
 	// recorded under it until now stay that one's
 	giveID(f.Providers, i, to, time.Now())

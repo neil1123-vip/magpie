@@ -838,6 +838,15 @@ function renderActivity() {
     };
     item.append(r);
     if (open) {
+      const recovery = {
+        "native-backed": "Native compaction, recovery copy available",
+        "native-only": "Native compaction, no local recovery copy",
+        restored: "Restored from local history",
+        "replayed-this-request": "Full history replayed for this request; later requests are assessed again",
+        excerpt: "Local excerpt, some history left out",
+        unavailable: "Recovery copy missing or no longer available",
+      }[c.recovery];
+      if (recovery) item.append(el("div", "hint call-recovery", t(recovery)));
       if (!callBodies.has(id)) loadCallBodies(c, id);
       const body = callBodies.get(id);
       const details = el("div", body.busy || body.error ? "" : "call-details");

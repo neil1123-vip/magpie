@@ -1,15 +1,155 @@
 package provider
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/recoverystore"
 	"github.com/yetone/magpie/internal/settings"
 )
+
+func TestRenameKeepsLocalRecoveryOwnership(t *testing.T) {
+	isolate(t)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	if err := Save(Provider{ID: "relay", Name: "Relay", Key: "k", Responses: "http://127.0.0.1:1/v1", NativeCompaction: true}); err != nil {
+		t.Fatal(err)
+	}
+	on, off := true, false
+	if err := recoverystore.Configure("relay", &on, nil); err != nil {
+		t.Fatal(err)
+	}
+	refused := func(to string) {
+		t.Helper()
+		if err := Rename("relay", to); err == nil || !strings.Contains(err.Error(), "local recovery") {
+			t.Fatalf("recovery ownership did not block rename: %v", err)
+		}
+		p, err := Find("relay")
+		if err != nil || p.ID != "relay" {
+			t.Fatalf("refused rename changed the ID: %+v %v", p, err)
+		}
+	}
+	refused("renamed")
+	r := recoverystore.Record{Scope: "caller", Provider: "relay", Writer: "account", Model: "m", Hash: "sealed",
+		Input: json.RawMessage(`[{"role":"user","content":"saved history"}]`), Output: json.RawMessage(`[{"type":"compaction","encrypted_content":"sealed"}]`)}
+	pending, err := recoverystore.Begin(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pending.Cancel()
+	if err := pending.Commit(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverystore.Configure("relay", &off, nil); err != nil {
+		t.Fatal(err)
+	}
+	refused("renamed")
+	if err := recoverystore.Configure("relay", &on, nil); err != nil {
+		t.Fatal(err)
+	}
+	if copy, err := recoverystore.Load(r.Scope, r.Hash); err != nil || string(copy.Input) != string(r.Input) {
+		t.Fatalf("refused rename damaged the copy: %+v %v", copy, err)
+	}
+	if err := recoverystore.Configure("relay", &off, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverystore.Clear(); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverystore.Configure("reused", &on, nil); err != nil {
+		t.Fatal(err)
+	}
+	refused("reused")
+	if err := recoverystore.Configure("reused", &off, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := Rename("relay", "renamed"); err != nil {
+		t.Fatalf("rename after explicit recovery removal: %v", err)
+	}
+}
+
+func TestRecoveryConfigureRejectsRenamedProviderSnapshot(t *testing.T) {
+	isolate(t)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	if err := Save(Provider{ID: "relay", Name: "Relay", Key: "k", Responses: "http://127.0.0.1:1/v1", NativeCompaction: true}); err != nil {
+		t.Fatal(err)
+	}
+	old, err := Find("relay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Rename("relay", "renamed"); err != nil {
+		t.Fatal(err)
+	}
+	on := true
+	if err := configureRecovery(*old, &on, nil); err == nil {
+		t.Fatal("the provider read before rename opted in its old ID")
+	}
+	config, err := recoverystore.LoadConfig()
+	if err != nil || len(config.Providers) != 0 {
+		t.Fatalf("stale provider opt-in was saved: %+v %v", config, err)
+	}
+	if id, err := ConfigureRecovery("relay", &on, nil); err != nil || id != "renamed" {
+		t.Fatalf("a fresh alias did not use the current ID: %q %v", id, err)
+	}
+	config, err = recoverystore.LoadConfig()
+	if err != nil || !slices.Equal(config.Providers, []string{"renamed"}) {
+		t.Fatalf("alias opted in the old ID: %+v %v", config, err)
+	}
+}
+
+func TestRecoveryConfigureRefreshesHeldProvider(t *testing.T) {
+	isolate(t)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	if err := Save(Provider{ID: "relay", Name: "Relay", Key: "k", Responses: "http://127.0.0.1:1/v1", NativeCompaction: true}); err != nil {
+		t.Fatal(err)
+	}
+	release := Hold()
+	defer release()
+	defer Changed()
+	old, err := Find("relay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep the held result fresh independently of the runner's speed.
+	held.Lock()
+	cached := held.built["all"]
+	cached.at = time.Now().Add(time.Hour)
+	held.built["all"] = cached
+	held.Unlock()
+	f, err := read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Providers[0].ID, f.Providers[0].Was = "renamed", []string{"relay"}
+	b, err := json.Marshal(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate another process: no catalog.Touched or Changed in this one.
+	if err := os.WriteFile(Path(), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if cached, err := Find("relay"); err != nil || cached.ID != "relay" {
+		t.Fatalf("fixture did not preserve the stale held catalog: %+v %v", cached, err)
+	}
+	on := true
+	if err := configureRecovery(*old, &on, nil); err == nil {
+		t.Fatal("the held catalog hid another process's rename")
+	}
+	config, err := recoverystore.LoadConfig()
+	if err != nil || len(config.Providers) != 0 {
+		t.Fatalf("cached provider opt-in was saved: %+v %v", config, err)
+	}
+}
 
 func TestRename(t *testing.T) {
 	isolate(t)

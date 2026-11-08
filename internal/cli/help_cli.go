@@ -95,6 +95,8 @@ func helpFor(args []string) string {
 		return claudeCodeUsage
 	case "settings":
 		return settingsUsage
+	case "compaction-recovery":
+		return compactionRecoveryUsage
 	case "list":
 		cmd = "ls"
 	case "account":

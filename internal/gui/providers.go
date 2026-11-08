@@ -26,6 +26,7 @@ import (
 	"github.com/yetone/magpie/internal/library"
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/recoverystore"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/update"
 	"github.com/yetone/magpie/internal/upstream"
@@ -846,6 +847,7 @@ type excludedJSON struct {
 }
 
 type providersJSON struct {
+	SavedID   string         `json:"savedID,omitempty"` // actual ID chosen by Add or Rename
 	Providers []providerJSON `json:"providers"`
 	Presets   []presetJSON   `json:"presets"`
 	// PluginPartners are the partners whose product is a plugin: the
@@ -2533,6 +2535,12 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 						return
 					}
 					in.ID = req.From
+					unlock, err := recoverystore.GuardProviderRename(in.ID, to)
+					if err != nil {
+						fail(rw, err)
+						return
+					}
+					unlock()
 				}
 				old, _ = provider.Find(in.ID)
 				if req.Proxy != nil {
@@ -2805,7 +2813,7 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				}
 				if rename {
 					if _, err := agent.RenameProvider(in.ID, to); err != nil {
-						fail(rw, err)
+						fail(rw, fmt.Errorf("provider settings were saved, but the ID change did not complete; reopen the provider before saving again: %w", err))
 						return
 					}
 					in.ID = to
@@ -3428,6 +3436,9 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			return
 		}
 		st := providersState()
+		if r.PathValue("action") == "save" {
+			st.SavedID = in.ID
+		}
 		st.Moved = moved
 		st.AgyMoved = agyMoved
 		st.Placed = placed

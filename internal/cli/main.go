@@ -93,6 +93,7 @@ const usage = `magpie — one place to pick every agent's model
   magpie provider add <name> k=v…      a custom vendor (magpie provider for the fields)
   magpie provider key|models|test|rm <id>
   magpie provider fallback <id> <provider/model>…   use these when it's out of quota or down
+  magpie compaction-recovery status|enable|disable|limit|clear|delete|allow   local recovery copies for native compaction (off by default)
   magpie import [-y] <link>       add the provider a magpie://import?… link describes
   magpie models [<agent>]         every model agents can pick, as provider/model; an agent's, and why others aren't
   magpie model name <provider/model> <name>|--reset       the name a model goes by, everywhere
@@ -659,6 +660,8 @@ func run(args []string) error {
 		return presets()
 	case "provider":
 		return providerCmd(args)
+	case "compaction-recovery":
+		return compactionRecoveryCmd(args[1:])
 	case "models":
 		return models(args[1:])
 	case "model":

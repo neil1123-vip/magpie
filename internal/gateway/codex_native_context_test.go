@@ -92,6 +92,10 @@ func TestCodexNativeModelsTakeSetWindows(t *testing.T) {
 	if _, err := provider.DropContext(*p, "gpt-6.1-sol"); err != nil {
 		t.Fatal(err)
 	}
+	p, err = provider.Find("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := provider.DropContext(*p, "gpt-5.5"); err != nil {
 		t.Fatal(err)
 	}

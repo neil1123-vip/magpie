@@ -46,6 +46,9 @@ function serve(lang, posts) {
     if (url.pathname === "/api/state") return json(state);
     if (url.pathname === "/api/providers") return json(providers);
     if (url.pathname === "/api/groups") return json({ groups: [] });
+    if (url.pathname === "/api/compaction-recovery") return json({
+      config: { providers: [], maxBytes: 512 * 1048576 }, bytes: 0, reservedBytes: 0, records: [], pending: 0, choices: [],
+    });
     if (url.pathname.startsWith("/api/provider/") && route.request().method() === "POST") {
       posts.push({ action: url.pathname.slice("/api/provider/".length), body: route.request().postDataJSON() });
       return json(providers);
@@ -59,7 +62,7 @@ function serve(lang, posts) {
 
 const strings = [
   "Compaction", "Codex compacts on this provider",
-  "When on, Codex's compaction request and the provider's encrypted summary pass through unchanged. The conversation can continue only on the provider and account that made the summary; if unavailable, magpie returns an error without dropping the context.",
+  "When on, Codex's compaction request and encrypted summary pass through unchanged. Recorded summaries stay on their original provider and account unless a usable local recovery copy can restore the history.",
   "When off, magpie generates a text summary. The conversation can then continue through magpie across accounts and providers.",
 ];
 const words = {
@@ -75,7 +78,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     for (const width of [1100, 420]) {
       const w = words[lang];
       const open = async (t, name) => {
-        const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+        const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch(
+          process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH } : { channel: "chromium" }));
         t.after(async () => {
           if (process.env.ARTIFACT_DIR) {
             await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
@@ -94,6 +98,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator(".row.provider", { hasText: name }).click();
         await unfold(page);
         await page.locator(".editor .bar").waitFor();
+        if (name === "Responses Relay" || name === "Codex") await page.locator(".native-compaction input").waitFor();
         return { page, errors, posts };
       };
       const row = (page) => page.locator(".editor label.tick", { hasText: w.tick });

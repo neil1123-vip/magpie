@@ -15,6 +15,8 @@ package gateway
 // would lose the conversation's earlier context unasked. A call beside
 // the conversation (compactionAside: Codex's auto-review and the like),
 // which its writer doesn't serve, goes without it instead.
+// With an opted-in local recovery copy, native_recovery.go can instead restore
+// the exact readable history and plan again under the current permissions.
 
 import (
 	"bytes"

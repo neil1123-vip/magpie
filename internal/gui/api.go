@@ -1717,6 +1717,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		writeJSON(rw, state())
 	})
 	providerRoutes(mux, w)
+	compactionRecoveryRoutes(mux)
 	sub2apiRoutes(mux, w)
 	importRoutes(mux)
 	usageRoutes(mux, w)
