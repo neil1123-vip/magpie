@@ -279,20 +279,23 @@ func (s Store) View(scope, branch, hash string) (Record, error) {
 }
 
 // SaveView writes an immutable branch version and atomically advances its
-// pointer. Replacing an existing version requires the Record from that View,
+// pointer, returning exactly the committed version. Replacing a version requires its Record,
 // so a concurrent edit or an old checkpoint cannot restore discarded history.
-func (s Store) SaveView(scope, branch, hash string, r Record) error {
+func (s Store) SaveView(scope, branch, hash string, r Record) (Record, error) {
 	if scope == "" || branch == "" || hash == "" || r.Scope != scope || r.Hash != hash || r.generation == 0 {
-		return ErrStale
+		return Record{}, ErrStale
 	}
 	if err := s.Check(r); err != nil {
-		return err
+		return Record{}, err
 	}
 	p, err := s.begin(r, "view", key(scope, branch, hash))
 	if err != nil {
-		return err
+		return Record{}, err
 	}
-	return p.Commit(r)
+	if err := p.Commit(r); err != nil {
+		return Record{}, err
+	}
+	return p.committed, nil
 }
 
 func (s Store) load(id, scope, hash string) (Record, error) {
@@ -382,7 +385,7 @@ func (s Store) Check(r Record) error {
 }
 
 func validate(r Record, complete bool) error {
-	if r.Scope == "" || r.Provider == "" || r.Omitted < 0 || len(r.Scope)+len(r.Provider)+len(r.Writer)+len(r.Model)+len(r.Hash) > maxMetadataBytes {
+	if r.Scope == "" || r.Provider == "" || r.Omitted < 0 || r.PrefixItems < 0 || len(r.Scope)+len(r.Provider)+len(r.Writer)+len(r.Model)+len(r.Hash) > maxMetadataBytes {
 		return errors.New("invalid local recovery metadata")
 	}
 	if len(r.Input) > MaxInputBytes || len(r.Output) > MaxOutputBytes {
@@ -390,6 +393,18 @@ func validate(r Record, complete bool) error {
 	}
 	if !array(r.Input) || (complete && (r.Hash == "" || !array(r.Output))) {
 		return errors.New("local recovery requires complete JSON input and output arrays")
+	}
+	if complete && r.PrefixItems > 0 {
+		var output []json.RawMessage
+		if json.Unmarshal(r.Output, &output) != nil || r.PrefixItems >= len(output) {
+			return errors.New("invalid local recovery retained prefix boundary")
+		}
+		for _, raw := range output[:r.PrefixItems] {
+			var item struct{ Type string }
+			if json.Unmarshal(raw, &item) != nil || item.Type == "compaction" || item.Type == "compaction_summary" || item.Type == "context_compaction" {
+				return errors.New("local recovery retained prefix cannot include a checkpoint")
+			}
+		}
 	}
 	return nil
 }

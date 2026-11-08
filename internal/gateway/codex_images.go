@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bufio"
 	"bytes"
 	"container/list"
 	"crypto/sha256"
@@ -294,6 +295,41 @@ const codexImageMaxBytes = 320 << 20
 // declared size no int holds still counts as too large.
 const holdsMost = codexImageMaxBytes + 1
 
+// PNG DecodeConfig stops at IHDR for gray images; tRNS changes their decoded pixels to RGBA.
+func imageConfig(src io.Reader) (image.Config, string, error) {
+	r := bufio.NewReader(src)
+	cfg, format, err := image.DecodeConfig(r)
+	if err != nil || format != "png" || cfg.ColorModel != color.GrayModel && cfg.ColorModel != color.Gray16Model {
+		return cfg, format, err
+	}
+	for {
+		var head [8]byte
+		if _, err := io.ReadFull(r, head[:]); err != nil {
+			return cfg, format, err
+		}
+		n := int64(binary.BigEndian.Uint32(head[:4]))
+		switch string(head[4:]) {
+		case "tRNS":
+			if n != 2 {
+				return cfg, format, png.FormatError("invalid gray transparency length")
+			}
+			if cfg.ColorModel == color.GrayModel {
+				cfg.ColorModel = color.NRGBAModel
+			} else {
+				cfg.ColorModel = color.NRGBA64Model
+			}
+			return cfg, format, nil
+		case "IDAT":
+			return cfg, format, nil
+		case "IEND":
+			return cfg, format, png.FormatError("missing image data")
+		}
+		if _, err := io.CopyN(io.Discard, r, n+4); err != nil {
+			return cfg, format, err
+		}
+	}
+}
+
 // imageHolds is what decoding an image of this header config holds: its
 // pixels in the image its format makes of them. That's the format's own
 // check above, so that the bytes a request holds follow the size it
@@ -336,7 +372,7 @@ func fitHolds(url string) int {
 	if len(b64) > codexImageMaxBytes {
 		return 0 // codexImageRefit turns it away before decoding
 	}
-	cfg, format, err := image.DecodeConfig(base64.NewDecoder(base64.StdEncoding, strings.NewReader(b64)))
+	cfg, format, err := imageConfig(base64.NewDecoder(base64.StdEncoding, strings.NewReader(b64)))
 	if err != nil {
 		return 0
 	}
@@ -465,7 +501,7 @@ func codexImageRefit(b64 string, l imageLimits) fitEntry {
 	if err != nil {
 		return fitEntry{}
 	}
-	cfg, format, err := image.DecodeConfig(bytes.NewReader(raw))
+	cfg, format, err := imageConfig(bytes.NewReader(raw))
 	if err != nil {
 		return fitEntry{}
 	}

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/recoverystore"
 )
 
 func TestRecoveryInputKeepsReadableHistory(t *testing.T) {
@@ -44,6 +45,9 @@ func TestRecoveryInputRefusesIncompleteHistory(t *testing.T) {
 		"file":            `{"input":[{"role":"user","content":[{"type":"input_file","file_id":"file_remote"}]}]}`,
 		"image":           `{"input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.test/photo.png"}]}]}`,
 		"unknown":         `{"input":[{"type":"new_private_item"}]}`,
+		"null tools":      `{"input":[{"type":"additional_tools","tools":null}]}`,
+		"invalid tool":    `{"input":[{"type":"additional_tools","tools":[null]}]}`,
+		"user tools":      `{"input":[{"type":"additional_tools","role":"user","tools":[]}]}`,
 		"null text":       `{"input":[{"role":"user","content":[{"type":"input_text","text":null}]}]}`,
 		"missing result":  `{"input":[{"type":"function_call","call_id":"a","name":"read","arguments":"{}"}]}`,
 		"missing call":    `{"input":[{"type":"function_call_output","call_id":"a","output":"result"}]}`,
@@ -56,7 +60,7 @@ func TestRecoveryInputRefusesIncompleteHistory(t *testing.T) {
 			}
 		})
 	}
-	input, err := recoveryInput([]byte(`{"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}]},{"type":"compaction","encrypted_content":"parent"}]}`))
+	input, err := recoveryInput([]byte(`{"input":[{"role":"user","content":[{"type":"input_image","image_url":"` + recoveryTestImage(t, 32, 32) + `"}]},{"type":"compaction","encrypted_content":"parent"}]}`))
 	if err != nil || !bytes.Contains(input, []byte(`"encrypted_content":"parent"`)) {
 		t.Fatalf("inline image and parent: %s, %v", input, err)
 	}
@@ -66,6 +70,28 @@ func TestRecoveryInputKeepsToolSearchDefinitions(t *testing.T) {
 	input, err := recoveryInput([]byte(`{"input":[{"type":"tool_search_call","call_id":"s","arguments":{"query":"files"},"encrypted_function_args":[ ]},{"type":"tool_search_output","call_id":"s","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}]}]}`))
 	if err != nil || !bytes.Contains(input, []byte(`"name":"read"`)) || bytes.Contains(input, []byte("encrypted_function_args")) {
 		t.Fatalf("tool search history: %s, %v", input, err)
+	}
+}
+
+func TestNativeRecoveryUsesCurrentAdditionalTools(t *testing.T) {
+	_, target := recoverySetup(t)
+	declaration := func(name string) string {
+		return fmt.Sprintf(`{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":%q,"parameters":{"type":"object"}}]}`, name)
+	}
+	body := `{"model":"fake/m1","stream":true,"input":[` + declaration("old_tool") + `,{"role":"user","content":"keep this history"},{"type":"compaction_trigger"}]}`
+	if w := recoveryPost(t, body, "tools-branch"); w.Code != 200 || w.Header().Get("X-Magpie-Recovery-State") != "native-backed" {
+		t.Fatalf("capture with tools: %d %s", w.Code, w.Body)
+	}
+	record, err := recoverystore.Load("local", checkpointKey("local-C1"))
+	if err != nil || bytes.Contains(record.Input, []byte("old_tool")) || !bytes.Contains(record.Input, []byte("keep this history")) {
+		t.Fatalf("saved request tools as history: %s, %v", record.Input, err)
+	}
+	for _, current := range []string{declaration("current_tool") + ",", ""} {
+		next := `{"model":"other/m1","stream":true,"input":[` + current + `{"type":"compaction","encrypted_content":"local-C1"},{"role":"user","content":"continue"}]}`
+		w := recoveryPost(t, next, "tools-branch")
+		if w.Code != 200 || bytes.Contains(target.got, []byte("old_tool")) || !bytes.Contains(target.got, []byte("keep this history")) || bytes.Contains(target.got, []byte("current_tool")) != (current != "") {
+			t.Fatalf("restored tools changed: %d %s; sent %s", w.Code, w.Body, target.got)
+		}
 	}
 }
 
@@ -166,14 +192,14 @@ func TestRecoveryExcerptKeepsCompleteToolExchange(t *testing.T) {
 		t.Fatal(err)
 	}
 	whole := json.RawMessage(`[{"role":"user","content":"old"},{"role":"assistant","content":"old answer"},` + last[2:])
-	excerpt, omitted, err := recoveryExcerpt(whole, len(clean))
+	excerpt, omitted, err := recoveryExcerpt(whole, len(clean), "")
 	if err != nil || omitted != 2 || !bytes.Equal(excerpt, clean) {
 		t.Fatalf("excerpt: %s, omitted %d, err %v", excerpt, omitted, err)
 	}
-	if _, _, err := recoveryExcerpt(whole, len(clean)-1); err == nil {
+	if _, _, err := recoveryExcerpt(whole, len(clean)-1, ""); err == nil {
 		t.Fatal("split the latest tool exchange to satisfy the budget")
 	}
-	if _, _, err := recoveryExcerpt(json.RawMessage(`[{"type":"compaction","encrypted_content":"parent"}]`), 1000); err == nil {
+	if _, _, err := recoveryExcerpt(json.RawMessage(`[{"type":"compaction","encrypted_content":"parent"}]`), 1000, ""); err == nil {
 		t.Fatal("excerpted an unresolved parent checkpoint")
 	}
 }

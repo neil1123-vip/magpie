@@ -435,6 +435,63 @@ func bombURL(w, h uint32, depth, colour byte) string {
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngHeader(w, h, depth, colour))
 }
 
+func pngWithGrayTransparency(raw []byte) []byte {
+	chunk := []byte{0, 0, 0, 2, 't', 'R', 'N', 'S', 0, 0, 0, 0, 0, 0}
+	binary.BigEndian.PutUint32(chunk[10:], crc32.ChecksumIEEE(chunk[4:10]))
+	out := append([]byte(nil), raw[:33]...)
+	out = append(out, chunk...)
+	return append(out, raw[33:]...)
+}
+
+func TestCodexTransparentGrayHolds(t *testing.T) {
+	for _, depth := range []int{8, 16} {
+		t.Run(fmt.Sprint(depth), func(t *testing.T) {
+			var im image.Image = image.NewGray(image.Rect(0, 0, 3, 2))
+			if depth == 16 {
+				im = image.NewGray16(im.Bounds())
+			}
+			var out bytes.Buffer
+			if err := png.Encode(&out, im); err != nil {
+				t.Fatal(err)
+			}
+			for _, transparent := range []bool{false, true} {
+				raw := out.Bytes()
+				if transparent {
+					raw = pngWithGrayTransparency(raw)
+				}
+				decoded, err := png.Decode(bytes.NewReader(raw))
+				if err != nil {
+					t.Fatal(err)
+				}
+				want, _ := imageHolds(image.Config{ColorModel: decoded.ColorModel(), Width: 3, Height: 2}, "png")
+				url := "data:image/png;base64," + base64.StdEncoding.EncodeToString(raw)
+				if got := fitHolds(url); got < len(raw)+want || got > len(raw)+want+2 {
+					t.Fatalf("transparent=%t: budget %d, decoded pixels %d plus file %d", transparent, got, want, len(raw))
+				}
+			}
+		})
+	}
+}
+
+func TestCodexGrayConfigChunkBounds(t *testing.T) {
+	header := pngHeader(1, 1, 8, 0)[:33:33]
+	for _, tail := range [][]byte{
+		{0, 0, 0},
+		{255, 255, 255, 255, 't', 'E', 'X', 't'},
+		{0, 0, 0, 1, 't', 'R', 'N', 'S'},
+	} {
+		if _, _, err := imageConfig(bytes.NewReader(append(header, tail...))); err == nil {
+			t.Fatal("accepted an incomplete or invalid gray PNG header")
+		}
+	}
+	// Skip a complete ancillary chunk without allocating its declared payload.
+	raw := append(header, 0, 0, 0, 0, 't', 'E', 'X', 't', 0, 0, 0, 0)
+	raw = append(raw, pngWithGrayTransparency(pngHeader(1, 1, 8, 0))[33:]...)
+	if cfg, _, err := imageConfig(bytes.NewReader(raw)); err != nil || cfg.ColorModel != color.NRGBAModel {
+		t.Fatalf("missed transparency after an ancillary chunk: %v", err)
+	}
+}
+
 // allocDuring is the bytes f allocates, from before it runs to after,
 // which is what a decode of a size it was given costs whether or not it
 // then finds the pixels.

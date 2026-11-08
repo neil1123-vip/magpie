@@ -47,6 +47,9 @@ func writeVendorErrorFrom(w http.ResponseWriter, proto, upstream provider.Protoc
 	msg = cmp.Or(msg, p.Name+": "+provider.APIError(body, res.Status))
 	told := upstreamTold(p.Name, res.StatusCode, res.Header, body, msg, p.IsPlugin())
 	if h := holdOf(w); h != nil {
+		if h.ctx != nil {
+			h.imageRecoveryRefused = recoveryImageRefused(h.ctx, res.StatusCode, body)
+		}
 		h.retellAs(msg, told)
 	} else {
 		msg = told

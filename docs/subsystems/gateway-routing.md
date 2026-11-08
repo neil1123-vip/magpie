@@ -10,6 +10,8 @@ candidate.
 This page covers how a request is routed. Plugins that change requests and
 replies are in [Gateway middleware](gateway-middleware.md). Subscriptions
 served by a plugin are in [Provider and plugin ownership](provider-plugins.md).
+Opt-in native checkpoint recovery and its publication, identity and capacity
+rules are in [Native compaction and local recovery](native-recovery.md).
 
 WorkBuddy and CodeBuddy Code's `X-Conversation-ID` is a native session header
 in `sessionHeaders` (`sessionOf`, `nativeSessionOf`, `conversationID` in

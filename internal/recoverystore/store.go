@@ -56,9 +56,11 @@ type Record struct {
 	Model    string          `json:"model"`
 	Input    json.RawMessage `json:"input"`
 	Output   json.RawMessage `json:"output,omitempty"`
-	Lossy    bool            `json:"lossy,omitempty"`
-	Omitted  int             `json:"omitted,omitempty"`
-	Created  time.Time       `json:"created"`
+	// PrefixItems marks the verified client prefix at the start of Output.
+	PrefixItems int       `json:"prefixItems,omitempty"`
+	Lossy       bool      `json:"lossy,omitempty"`
+	Omitted     int       `json:"omitted,omitempty"`
+	Created     time.Time `json:"created"`
 
 	generation uint64
 	id         string
@@ -121,7 +123,7 @@ func Check(r Record) error                            { return Store{}.Check(r) 
 func Begin(r Record) (*Pending, error)                { return Store{}.Begin(r) }
 func Load(scope, hash string) (Record, error)         { return Store{}.Load(scope, hash) }
 func View(scope, branch, hash string) (Record, error) { return Store{}.View(scope, branch, hash) }
-func SaveView(scope, branch, hash string, r Record) error {
+func SaveView(scope, branch, hash string, r Record) (Record, error) {
 	return Store{}.SaveView(scope, branch, hash, r)
 }
 func Configure(provider string, enabled *bool, maxBytes *int64) error {

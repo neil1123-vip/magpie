@@ -28,6 +28,7 @@ type nativeRecovery struct {
 	err              error
 	pending          *recoverystore.Pending
 	source           recoverystore.Record
+	capturePrefix    json.RawMessage
 	parents          []recoverystore.Record
 	views            []recoverystore.Record
 	writer           candidate
@@ -37,6 +38,11 @@ type nativeRecovery struct {
 	adopted          bool
 	currentWindow    int
 	currentOutput    int
+	currentModel     string
+	currentImages    *[32]byte
+	capacityReason   string
+	excerptInput     json.RawMessage
+	excerptOmitted   int
 	capacity         bool
 	state            string
 	calls            []Call
@@ -172,7 +178,7 @@ func (s *Server) withNativeRecovery(w http.ResponseWriter, r *http.Request, body
 		}
 	}()
 	// A previously adopted view survives restarts and the writer coming back.
-	if scope != "" && branch != "" {
+	if scope != "" {
 		b, records, err := recoveryExpand(scope, branch, body, true)
 		if err != nil {
 			writeError(w, provider.Responses, 409, "Local recovery: "+err.Error())
@@ -198,6 +204,8 @@ func (s *Server) withNativeRecovery(w http.ResponseWriter, r *http.Request, body
 			x.state = state
 		}
 		x.retry, x.err = false, nil
+		x.capacity, x.window, x.capacityReason = false, 0, ""
+		x.excerptInput, x.excerptOmitted = nil, 0
 		next(capture, r, x.body)
 		if capture.over {
 			x.err = errors.New("compaction output exceeds the local recovery buffer limit; original history must be kept")
@@ -245,7 +253,10 @@ func (s *Server) withNativeRecovery(w http.ResponseWriter, r *http.Request, body
 				writeError(w, provider.Responses, 409, "Local recovery: "+err.Error())
 				return
 			}
-			why := "The restored history does not fit an allowed model. Choose a larger context window."
+			why := "The restored history cannot be replayed by an allowed model."
+			if x.capacityReason != "" {
+				why += " " + x.capacityReason
+			}
 			if branch != "" && x.window > 0 {
 				id, offerErr := offerRecoveryChoice(scope, branch, x.original, why, "excerpt")
 				if offerErr != nil {
@@ -267,6 +278,16 @@ func (s *Server) withNativeRecovery(w http.ResponseWriter, r *http.Request, body
 			for _, parent := range x.parents {
 				if err == nil {
 					err = recoverystore.Check(parent)
+				}
+			}
+			if err == nil {
+				if len(x.capturePrefix) > 0 {
+					prefix, _ := recoveryItems(x.capturePrefix)
+					items, _ := recoveryItems(output)
+					output, err = json.Marshal(append(prefix, items...))
+					if len(output) > recoverystore.MaxOutputBytes {
+						err = errors.New("compaction output and retained client prefix exceed the local recovery limit")
+					}
 				}
 			}
 			if err == nil {
@@ -314,10 +335,10 @@ func recoveryExpand(scope, branch string, body []byte, viewsOnly bool) ([]byte, 
 			record, err = recoverystore.View(scope, branch, hash)
 		}
 		if errors.Is(err, recoverystore.ErrNotFound) {
-			if viewsOnly {
+			record, err = recoverystore.Load(scope, hash)
+			if viewsOnly && (errors.Is(err, recoverystore.ErrNotFound) || errors.Is(err, recoverystore.ErrStale) || err == nil && (!record.Lossy || record.PrefixItems == 0)) {
 				continue
 			}
-			record, err = recoverystore.Load(scope, hash)
 		}
 		if err != nil {
 			return nil, nil, err
@@ -325,9 +346,14 @@ func recoveryExpand(scope, branch string, body []byte, viewsOnly bool) ([]byte, 
 		if len(sealedCompactions(append(append([]byte(`{"input":`), record.Input...), '}'))) != 0 {
 			return nil, nil, errors.New("recovery source has an unresolved parent checkpoint")
 		}
-		body, err = recoveryReplace(body, record.Output, record.Input)
+		previousOutput := record.Output
+		body, record.Output, err = recoveryReplacement(body, previousOutput, record.Input, record.Input)
 		if err != nil {
 			return nil, nil, err
+		}
+		record.PrefixItems += len(gjson.ParseBytes(record.Output).Array()) - len(gjson.ParseBytes(previousOutput).Array())
+		if len(record.Output) > recoverystore.MaxOutputBytes {
+			return nil, nil, errors.New("retained client prefix exceeds the local recovery output limit")
 		}
 		if len(body) > recoverystore.MaxInputBytes {
 			return nil, nil, errors.New("expanded history exceeds the local recovery limit")
@@ -358,30 +384,24 @@ func recoveryExpand(scope, branch string, body []byte, viewsOnly bool) ([]byte, 
 
 // One UTF-8 byte per token is a conservative bound for readable text. Media
 // needs model-specific tokenization, so unknown media budgets fail closed.
-func recoveryBudget(body []byte) (int, error) {
+func recoveryBudget(body []byte, model string) (int, error) {
 	var request map[string]json.RawMessage
 	if json.Unmarshal(body, &request) != nil {
 		return 0, errors.New("cannot budget an invalid restored request")
 	}
-	input, err := recoveryInput(body)
+	_, err := recoveryInput(body)
 	if err != nil {
 		return 0, err
 	}
-	for _, item := range gjson.ParseBytes(input).Array() {
-		for _, field := range []string{"content", "output"} {
-			for _, part := range item.Get(field).Array() {
-				switch part.Get("type").Str {
-				case "input_image", "image_url", "input_file", "input_audio":
-					return 0, errors.New("cannot safely budget this model's media tokens for local recovery")
-				}
-			}
-		}
+	cost, err := recoveryRequestCost(body, model)
+	if err != nil {
+		return 0, err
 	}
 	n, err := recoveryOutputLimit(body, provider.Responses, 8192)
 	if err != nil {
 		return 0, err
 	}
-	return len(body) + n + 4096, nil
+	return cost + n + 4096, nil
 }
 
 var errRecoveryWindow = errors.New("restored history exceeds the model context window")
@@ -428,50 +448,52 @@ func (s *Server) prepareNativeRecovery(r *http.Request, c candidate, body []byte
 		window := windowOf(c.p, c.model)
 		x.currentWindow = window
 		x.currentOutput = 0
+		x.currentModel = provider.UpstreamNameIn(wiresOf(r.Context()), c.p.ID, c.model)
+		x.currentImages = nil
+		if recoveryHasImages(x.body) {
+			// The target's own prompt may insert a developer item before the images.
+			images := recoveryImageHistory(withModelSystem(r, c.p, c.model, provider.Responses, x.body))
+			x.currentImages = &images
+		}
+		images, known := false, (*bool)(nil)
 		// A backend may remove the request's cap; only its model limit then bounds output.
 		for _, m := range c.p.Available() {
 			if m.ID == c.model {
 				x.currentOutput = m.Output
+				images, known = m.Images, m.ImageInput
 				break
 			}
 		}
-		needed, err := recoveryBudget(body)
-		if err != nil {
-			return err
+		_, known = provider.ApplyImage(c.p.ID, c.model, images, known)
+		if recoveryHasImages(x.body) && !slices.Contains(s.usable(c.p, c.model), provider.Responses) {
+			return x.cannotReplay(errors.New("image recovery currently requires a Responses endpoint"))
 		}
-		canonicalNeeded, err := recoveryBudget(x.body)
+		if recoveryHasImages(x.body) && (known != nil && !*known || s.sightRefused(c.p.ID, c.model)) {
+			return x.cannotReplay(fmt.Errorf("%s/%s does not support image input", c.p.ID, c.model))
+		}
+		if recoveryHasImages(x.body) {
+			if n := s.imageCap(c.p, withFields(body, map[string]any{"model": x.currentModel})); n > 0 && recoveryCountImages(x.body) > n {
+				return x.cannotReplay(fmt.Errorf("%s/%s takes at most %d images", c.p.ID, c.model, n))
+			}
+		}
+		needed, err := recoveryBudget(body, x.currentModel)
 		if err != nil {
-			return err
+			return x.cannotReplay(err)
+		}
+		canonicalNeeded, err := recoveryBudget(x.body, x.currentModel)
+		if err != nil {
+			return x.cannotReplay(err)
 		}
 		needed = max(needed, canonicalNeeded)
 		if window <= 0 || needed > window {
-			x.window = max(x.window, window-max(0, needed-canonicalNeeded))
-			x.capacity = true
-			return fmt.Errorf("%w: %s/%s needs at most %d tokens, window %d", errRecoveryWindow, c.p.ID, c.model, needed, window)
+			x.considerExcerpt(x.currentModel, window-max(0, needed-canonicalNeeded))
+			return x.cannotReplay(fmt.Errorf("%s/%s needs at most %d tokens, window %d", c.p.ID, c.model, needed, window))
 		}
 		x.capacity = false
 		for _, record := range x.parents {
 			if err := recoverystore.Check(record); err != nil {
 				return err
 			}
-		}
-		if !x.adopted && x.branch != "" {
-			for i, record := range x.views {
-				if err := recoverystore.SaveView(x.scope, x.branch, record.Hash, record); err != nil {
-					return err
-				}
-				view, err := recoverystore.View(x.scope, x.branch, record.Hash)
-				if err != nil {
-					return err
-				}
-				x.views[i] = view
-				for j, parent := range x.parents {
-					if parent.Hash == record.Hash {
-						x.parents[j] = view
-					}
-				}
-			}
-			x.adopted = true
 		}
 		r.Header.Del("X-Magpie-Recovery")
 	}
@@ -482,6 +504,7 @@ func (s *Server) prepareNativeRecovery(r *http.Request, c candidate, body []byte
 		x.pending.Cancel()
 		x.pending = nil
 	}
+	x.capturePrefix = nil
 	x.writer = c
 	enabled, err := recoverystore.Enabled(c.p.ID)
 	if err != nil {
@@ -532,6 +555,12 @@ func (s *Server) prepareNativeRecovery(r *http.Request, c candidate, body []byte
 		var input json.RawMessage
 		input, err = recoveryInput(canonical)
 		if err == nil {
+			// Tool declarations belong to the current request, not the saved history.
+			items, _ := recoveryItems(input)
+			items = slices.DeleteFunc(items, func(item json.RawMessage) bool {
+				return gjson.GetBytes(item, "type").Str == "additional_tools"
+			})
+			input, _ = json.Marshal(items)
 			x.source = recoverystore.Record{Scope: x.scope, Provider: c.p.ID, Writer: c.who(), Model: c.model, Input: input}
 			unique := make([]recoverystore.Record, 0, len(x.parents)+len(parents))
 			for _, parent := range append(slices.Clone(x.parents), parents...) {
@@ -547,7 +576,11 @@ func (s *Server) prepareNativeRecovery(r *http.Request, c candidate, body []byte
 			}
 			if err == nil {
 				x.parents = unique
-				x.pending, err = recoverystore.Begin(x.source)
+				x.capturePrefix, err = recoveryCarryPrefix(x.original, unique)
+				if err == nil {
+					x.source.PrefixItems = len(gjson.ParseBytes(x.capturePrefix).Array())
+					x.pending, err = recoverystore.Begin(x.source)
+				}
 			}
 		}
 	}
@@ -572,20 +605,19 @@ func (x *nativeRecovery) excerpt() error {
 		return errors.New("a local excerpt requires one checkpoint and a reliable branch identity")
 	}
 	view := x.views[0]
-	needed, err := recoveryBudget(x.body)
+	if x.excerptInput == nil {
+		return errors.New("latest complete interaction does not fit an allowed recovery model")
+	}
+	input, omitted := x.excerptInput, x.excerptOmitted
+	body, output, err := recoveryReplacement(x.original, view.Output, view.Input, input)
 	if err != nil {
 		return err
 	}
-	budget := x.window - (needed - len(view.Input)) - 1024
-	input, omitted, err := recoveryExcerpt(view.Input, budget)
-	if err != nil {
-		return err
+	if len(output) > recoverystore.MaxOutputBytes {
+		return errors.New("retained client prefix exceeds the local recovery output limit")
 	}
-	view.Input, view.Lossy, view.Omitted = input, true, view.Omitted+omitted
-	body, err := recoveryReplace(x.original, view.Output, input)
-	if err != nil {
-		return err
-	}
+	view.PrefixItems += len(gjson.ParseBytes(output).Array()) - len(gjson.ParseBytes(view.Output).Array())
+	view.Input, view.Output, view.Lossy, view.Omitted = input, output, true, view.Omitted+omitted
 	x.body, x.views, x.adopted = body, []recoverystore.Record{view}, false
 	var request map[string]json.RawMessage
 	_ = json.Unmarshal(x.body, &request)
@@ -594,6 +626,60 @@ func (x *nativeRecovery) excerpt() error {
 		x.body, _ = json.Marshal(request)
 	}
 	return nil
+}
+
+// A later checkpoint must also consume the proven client prefix, even after the
+// source messages it represented have been discarded by an excerpt.
+func recoveryCarryPrefix(body []byte, parents []recoverystore.Record) (json.RawMessage, error) {
+	var carry []json.RawMessage
+	for _, parent := range parents {
+		if !parent.Lossy || parent.PrefixItems == 0 {
+			continue
+		}
+		if _, _, err := recoveryReplacement(body, parent.Output, parent.Input, parent.Input); err != nil {
+			return nil, err
+		}
+		output, _ := recoveryItems(parent.Output)
+		if parent.PrefixItems < 0 || parent.PrefixItems >= len(output) {
+			return nil, errors.New("invalid retained client prefix length")
+		}
+		if len(carry) > 0 {
+			return nil, errors.New("cannot carry multiple retained client prefixes into one checkpoint")
+		}
+		carry = output[:parent.PrefixItems]
+	}
+	if len(carry) == 0 {
+		return nil, nil
+	}
+	prefix, err := json.Marshal(carry)
+	if len(prefix) > recoverystore.MaxOutputBytes {
+		return nil, errors.New("retained client prefix exceeds the local recovery output limit")
+	}
+	return prefix, err
+}
+
+func (x *nativeRecovery) cannotReplay(err error) error {
+	x.capacity, x.capacityReason = true, err.Error()
+	return fmt.Errorf("%w: %s", errRecoveryWindow, err)
+}
+
+func (x *nativeRecovery) considerExcerpt(model string, window int) {
+	if x.branch == "" || len(x.views) != 1 || window <= 0 {
+		return
+	}
+	needed, err := recoveryBudget(x.body, model)
+	if err != nil {
+		return
+	}
+	view := x.views[0]
+	cost, _, err := recoveryInputCost(gjson.ParseBytes(view.Input), model)
+	if err != nil {
+		return
+	}
+	input, omitted, err := recoveryExcerpt(view.Input, window-(needed-cost)-1024, model)
+	if err == nil && (x.excerptInput == nil || omitted < x.excerptOmitted) {
+		x.window, x.excerptInput, x.excerptOmitted = window, input, omitted
+	}
 }
 
 func recoveryWireCheck(ctx context.Context, to provider.Protocol, body []byte) error {
@@ -623,12 +709,6 @@ func recoveryWireCheck(ctx context.Context, to provider.Protocol, body []byte) e
 	if !x.restored {
 		return nil
 	}
-	for _, parent := range x.parents {
-		if err := recoverystore.Check(parent); err != nil {
-			x.err = err
-			return err
-		}
-	}
 	reserve, err := recoveryOutputLimit(body, to, x.currentOutput)
 	if err != nil {
 		if errors.Is(err, errRecoveryWindow) {
@@ -638,13 +718,63 @@ func recoveryWireCheck(ctx context.Context, to provider.Protocol, body []byte) e
 		}
 		return err
 	}
-	needed := len(body) + reserve + 4096
+	cost := len(body)
+	model := modelOf(body)
+	if model == "" {
+		model = x.currentModel
+	}
+	if recoveryHasImages(x.body) || to == provider.Responses && recoveryHasImages(body) || to != provider.Responses && hasImage(to, body) {
+		if model != x.currentModel {
+			return x.cannotReplay(errors.New("target changed the recovery model after its capacity check"))
+		}
+		if to != provider.Responses {
+			return x.cannotReplay(errors.New("image recovery currently requires a Responses endpoint"))
+		}
+		expected := recoveryImageHistory(x.body)
+		if x.currentImages != nil {
+			expected = *x.currentImages
+		}
+		if expected != recoveryImageHistory(body) {
+			return x.cannotReplay(errors.New("target changed restored images, their detail or their history positions"))
+		}
+	}
+	if to == provider.Responses {
+		cost, err = recoveryRequestCost(body, model)
+		if err != nil {
+			return x.cannotReplay(err)
+		}
+	} else if len(body) > recoverystore.MaxInputBytes {
+		return x.cannotReplay(errors.New("restored request exceeds the 32 MiB local recovery limit"))
+	}
+	needed := cost + reserve + 4096
 	if x.currentWindow <= 0 || needed > x.currentWindow {
 		x.capacity = true
-		if canonical, err := recoveryBudget(x.body); err == nil {
-			x.window = max(x.window, x.currentWindow-max(0, needed-canonical))
+		if canonical, err := recoveryBudget(x.body, model); err == nil {
+			x.considerExcerpt(model, x.currentWindow-max(0, needed-canonical))
 		}
-		return errRecoveryWindow
+		return x.cannotReplay(fmt.Errorf("final request needs at most %d tokens, window %d", needed, x.currentWindow))
+	}
+	if !x.adopted && x.branch != "" {
+		for i, record := range x.views {
+			view, err := recoverystore.SaveView(x.scope, x.branch, record.Hash, record)
+			if err != nil {
+				x.err = err
+				return err
+			}
+			x.views[i] = view
+			for j, parent := range x.parents {
+				if parent.Hash == record.Hash {
+					x.parents[j] = view
+				}
+			}
+		}
+		x.adopted = true
+	}
+	for _, parent := range x.parents {
+		if err := recoverystore.Check(parent); err != nil {
+			x.err = err
+			return err
+		}
 	}
 	return nil
 }
@@ -747,7 +877,7 @@ func (w *recoveryWriter) Write(p []byte) (int, error) {
 	if w.status == 0 {
 		w.status = 200
 	}
-	if !w.passed && len(bytes.TrimSpace(bytes.ReplaceAll(p, []byte(":"), nil))) == 0 {
+	if !w.passed && recoveryKeepalive(p) {
 		return len(p), nil // hold transport keepalives until a real reply
 	}
 	buffered := w.compact && (w.recovery == nil || w.recovery.pending != nil || w.recovery.nativeOnly)
@@ -766,6 +896,16 @@ func (w *recoveryWriter) Write(p []byte) (int, error) {
 		return 0, errors.New("local recovery response buffer is full")
 	}
 	return w.buf.Write(p)
+}
+
+func recoveryKeepalive(p []byte) bool {
+	for line := range bytes.SplitSeq(p, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) > 0 && line[0] != ':' {
+			return false
+		}
+	}
+	return true
 }
 func (w *recoveryWriter) Flush() {
 	if w.passed {

@@ -77,7 +77,7 @@ func claudeImageRefit(data string) fitEntry {
 	if err != nil {
 		return fitEntry{}
 	}
-	cfg, format, err := image.DecodeConfig(bytes.NewReader(raw))
+	cfg, format, err := imageConfig(bytes.NewReader(raw))
 	if err != nil {
 		return fitEntry{}
 	}

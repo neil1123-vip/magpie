@@ -2643,12 +2643,13 @@ type holdWriter struct {
 	passing bool
 	held    bytes.Buffer
 
-	stream     bool      // a stream held until its first content
-	since      time.Time // when it began
-	scanned    int       // how much of held has been read as events
-	failure    int       // the status the stream's error stands for
-	failMsg    string
-	sharedPool bool // an OpenRouter upstream pool rejected this attempt
+	stream               bool      // a stream held until its first content
+	since                time.Time // when it began
+	scanned              int       // how much of held has been read as events
+	failure              int       // the status the stream's error stands for
+	failMsg              string
+	sharedPool           bool // an OpenRouter upstream pool rejected this attempt
+	imageRecoveryRefused bool // matched before the vendor message is rewritten
 
 	// turnedAway: the account is asked with the system prompt Antigravity
 	// answers with a 429 whatever quota it has left — Claude Code's, its

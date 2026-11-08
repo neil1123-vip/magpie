@@ -220,6 +220,45 @@ func TestPreparedInputAndCheckpointAreImmutable(t *testing.T) {
 	}
 }
 
+func TestRetainedPrefixBoundarySurvivesCommitAndReload(t *testing.T) {
+	for _, count := range []int{0, 1, -1, 2, 3} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			s := testStore(t)
+			r := example()
+			r.PrefixItems = count
+			r.Output = json.RawMessage(`[{"role":"user","content":"omitted client prefix"},{"type":"compaction","encrypted_content":"seal"}]`)
+			p, err := s.Begin(r)
+			if err == nil {
+				defer p.Cancel()
+				// The response supplies no prefix metadata; Begin already fixed it.
+				err = p.Commit(Record{Hash: r.Hash, Output: r.Output})
+			}
+			if count < 0 || count >= 2 {
+				if err == nil {
+					t.Fatal("invalid retained prefix boundary was committed")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			saved, err := (Store{Dir: s.Dir}).Load(r.Scope, r.Hash)
+			if err != nil {
+				t.Fatal(err)
+			}
+			view, err := s.SaveView(r.Scope, "branch", r.Hash, saved)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, record := range []Record{saved, view} {
+				if record.PrefixItems != count {
+					t.Fatalf("retained prefix boundary = %d, want %d", record.PrefixItems, count)
+				}
+			}
+		})
+	}
+}
+
 func TestPayloadPreservesHTMLCharactersAndChecksums(t *testing.T) {
 	s := testStore(t)
 	r := example()
@@ -259,7 +298,7 @@ func TestViewsRemainScopedAndLossyDescendantsAreMaterialized(t *testing.T) {
 	r := put(t, s, example())
 	r.Input = json.RawMessage(`[{"role":"user","content":"selected history"}]`)
 	r.Lossy, r.Omitted = true, 4
-	if err := s.SaveView(r.Scope, "branch-a", r.Hash, r); err != nil {
+	if _, err := s.SaveView(r.Scope, "branch-a", r.Hash, r); err != nil {
 		t.Fatal(err)
 	}
 	view, err := s.View(r.Scope, "branch-a", r.Hash)
@@ -269,7 +308,7 @@ func TestViewsRemainScopedAndLossyDescendantsAreMaterialized(t *testing.T) {
 	if _, err := s.View(r.Scope, "branch-b", r.Hash); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("view leaked to sibling: %v", err)
 	}
-	if err := s.SaveView(r.Scope, "", r.Hash, r); !errors.Is(err, ErrStale) {
+	if _, err := s.SaveView(r.Scope, "", r.Hash, r); !errors.Is(err, ErrStale) {
 		t.Fatalf("anonymous branch acquired state: %v", err)
 	}
 	view.Hash = "ciphertext-b"
@@ -295,12 +334,12 @@ func TestViewsRemainScopedAndLossyDescendantsAreMaterialized(t *testing.T) {
 func TestViewReplacementRejectsConcurrentAndOriginalVersions(t *testing.T) {
 	s := testStore(t)
 	original := put(t, s, example())
-	if err := s.SaveView(original.Scope, "branch", original.Hash, original); err != nil {
-		t.Fatal(err)
-	}
-	current, err := s.View(original.Scope, "branch", original.Hash)
+	current, err := s.SaveView(original.Scope, "branch", original.Hash, original)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if current.id == original.id || !bytes.Equal(current.Input, original.Input) || s.Check(current) != nil {
+		t.Fatal("SaveView did not return its committed branch version")
 	}
 	trimmed := current
 	trimmed.Input, trimmed.Lossy, trimmed.Omitted = json.RawMessage(`[{"role":"user","content":"selected"}]`), true, 3
@@ -311,13 +350,14 @@ func TestViewReplacementRejectsConcurrentAndOriginalVersions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer p.Cancel()
-	if err := s.SaveView(original.Scope, "branch", original.Hash, trimmed); err != nil {
+	saved, err := s.SaveView(original.Scope, "branch", original.Hash, trimmed)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := p.Commit(concurrent); !errors.Is(err, ErrConflict) {
 		t.Fatalf("concurrent version overwrote the view: %v", err)
 	}
-	if err := s.SaveView(original.Scope, "branch", original.Hash, original); !errors.Is(err, ErrConflict) {
+	if _, err := s.SaveView(original.Scope, "branch", original.Hash, original); !errors.Is(err, ErrConflict) {
 		t.Fatalf("original checkpoint restored discarded history: %v", err)
 	}
 	if err := s.Check(current); !errors.Is(err, ErrStale) {
@@ -328,8 +368,11 @@ func TestViewReplacementRejectsConcurrentAndOriginalVersions(t *testing.T) {
 		t.Fatalf("current view was poisoned by rejected write: %+v, %v", latest, err)
 	}
 	latest.Input, latest.Omitted = json.RawMessage(`[]`), 5
-	if err := s.SaveView(latest.Scope, "branch", latest.Hash, latest); err != nil {
+	if _, err := s.SaveView(latest.Scope, "branch", latest.Hash, latest); err != nil {
 		t.Fatalf("current view could not be shortened again: %v", err)
+	}
+	if err := s.Check(saved); !errors.Is(err, ErrStale) || !bytes.Equal(saved.Input, trimmed.Input) || saved.Omitted != 3 {
+		t.Fatalf("committed version followed a later edit: %+v, %v", saved, err)
 	}
 }
 

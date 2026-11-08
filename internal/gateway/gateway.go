@@ -3268,7 +3268,7 @@ func (s *Server) serveCore(w http.ResponseWriter, r *http.Request, from provider
 	}
 	// Unless a model that sees describes them to it (vision.go).
 	seeing := sync.OnceValues(func() (string, bool) {
-		if describing(r.Context()) {
+		if describing(r.Context()) || recoveryReplaying(r.Context()) {
 			return "", false
 		}
 		return seer()
@@ -3288,7 +3288,7 @@ func (s *Server) serveCore(w http.ResponseWriter, r *http.Request, from provider
 			imageInput, unknownSight = &no, imageInput == nil && !s.sightRefused(p.ID, model)
 		}
 	}
-	if imageInput != nil && !*imageInput {
+	if imageInput != nil && !*imageInput && !recoveryReplaying(r.Context()) {
 		var currentImage bool
 		if see, ok := seeing(); ok && hasImage(from, body) {
 			seen, err := s.seenBody(withDescribeFor(r.Context(), call.Agent, call.Model, sessionOf(r.Header), unknownSight), from, body, see)
@@ -3670,7 +3670,7 @@ func (s *Server) serveCore(w http.ResponseWriter, r *http.Request, from provider
 			})
 		}
 	}
-	if isGroup && seenGroup == nil {
+	if isGroup && seenGroup == nil && !recoveryReplaying(r.Context()) {
 		// without a model to describe it, a new image goes only to the
 		// members that see it (#756) — to members magpie knows nothing
 		// of when none is known to see, as a model of its own would be
@@ -4264,7 +4264,7 @@ func (s *Server) serveCore(w http.ResponseWriter, r *http.Request, from provider
 				attemptBody = b
 			}
 		}
-		if isGroup {
+		if isGroup && !recoveryReplaying(r.Context()) {
 			in := membersImageInput([]provider.Member{{Provider: c.p, Model: c.model}})
 			if seenGroup != nil && s.blindTo(c.p.ID, c.model, in) {
 				groupUnknown = in == nil
@@ -4298,7 +4298,7 @@ func (s *Server) serveCore(w http.ResponseWriter, r *http.Request, from provider
 		// the system prompt the user gave this model goes after the
 		// agent's own (model_system.go)
 		attemptBody = withModelSystem(r, c.p, c.model, from, attemptBody)
-		if !s.fits(c.p.ID, webpRefused, from) {
+		if !recoveryReplaying(r.Context()) && !s.fits(c.p.ID, webpRefused, from) {
 			// a provider that took a webp picture for one it can't read
 			// (webp.go) has every one of its requests' webps written again
 			// before they leave, its later turns not paying the refusal
@@ -4306,7 +4306,7 @@ func (s *Server) serveCore(w http.ResponseWriter, r *http.Request, from provider
 			attemptBody = webpAsJPEG(from, attemptBody)
 		}
 		// Codex's detail "original" goes only where it is taken (qiu_eth)
-		if from == provider.Responses && !takesOriginalDetail(c.p) {
+		if from == provider.Responses && !recoveryReplaying(r.Context()) && !takesOriginalDetail(c.p) {
 			attemptBody = originalAsHigh(attemptBody)
 		}
 		// a value masking swapped for a placeholder: the model is told to
@@ -5016,6 +5016,17 @@ func (s *Server) serveCore(w http.ResponseWriter, r *http.Request, from provider
 			continue
 		}
 		watched.attempt(call, try, c.p.ID, sent, hw, capture)
+		if !last && !pass && hw.mayAskAgain() && !hw.handedOver &&
+			(hw.imageRecoveryRefused || recoveryImageRefused(r.Context(), hw.code(), hw.errBody())) {
+			// Try the next allowed target without changing images or learning a model restriction.
+			if other == nil {
+				other = &Try{Status: call.Status, Error: call.Error, errType: call.Usage.ErrType}
+			}
+			try.Fail = failOther
+			s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
+			skipped = append(skipped, c.label()+": "+call.Error)
+			continue
+		}
 		if autoPicks(c) && repicked < 2 && !hw.passing && hw.code() == http.StatusBadRequest &&
 			(provider.CopilotRefusal(hw.errBody()) || wrongEndpoint(hw.code(), hw.errBody())) {
 			// Copilot refused the model its Auto picked, and Auto has
@@ -5337,7 +5348,7 @@ func (s *Server) serveCore(w http.ResponseWriter, r *http.Request, from provider
 				continue
 			}
 		}
-		if !hw.passing && badRequest(hw.code()) && hw.mayAskAgain() && zhipuImageRefusal.Match(wordsOf(hw.errBody())) {
+		if !recoveryReplaying(r.Context()) && !hw.passing && badRequest(hw.code()) && hw.mayAskAgain() && zhipuImageRefusal.Match(wordsOf(hw.errBody())) {
 			if b := webpAsJPEG(from, attemptBody); !bytes.Equal(b, attemptBody) {
 				// GLM can't read a webp picture (Claude Desktop's browser
 				// screenshot, #4732), and the session's history carries it,
@@ -6327,7 +6338,7 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 	// Codex's compaction trigger, or a compaction sealed where native
 	// compaction is on, goes as it came: a translation would leave it out
 	// (#1099)
-	keep := s.keepsCompaction(from, p, model, body)
+	keep := s.keepsCompaction(from, p, model, body) || from == provider.Responses && recoveryProtected(r)
 	// /responses/compact goes as it came, and only to a provider that
 	// has the route (responses_compact.go)
 	compact := from == provider.Responses && unaryCompact(r)
@@ -6540,12 +6551,19 @@ func (s *Server) forward(ctx context.Context, p provider.Provider, to provider.P
 		// once, never again in another shape
 		return res, err
 	}
-	if err == nil && res.StatusCode >= 400 {
+	if err == nil && res.StatusCode >= 400 && recoveryReplaying(ctx) {
+		if b := peekError(res); byteCapRefusal(res.StatusCode, b) || learnedImageCap(p, b) > 0 {
+			// Preserve the history and try another candidate, without a smaller retry.
+			res.StatusCode, res.Status = http.StatusRequestEntityTooLarge, "413 Request Entity Too Large"
+			x, _ := ctx.Value(nativeRecoveryKey{}).(*nativeRecovery)
+			x.capacity, x.capacityReason = true, "The provider refused the restored request size or image count."
+		}
+	} else if err == nil && res.StatusCode >= 400 {
 		// a body over the provider's byte cap: asked again with its
 		// oldest images left out, or said as a 413 (body_cap.go)
 		res, err = s.refitOverCap(ctx, p, to, path, body, in, res)
 	}
-	if err == nil && res.StatusCode >= 400 {
+	if err == nil && res.StatusCode >= 400 && !recoveryReplaying(ctx) {
 		// more images than the model takes: asked again with its oldest
 		// left out (image_cap.go)
 		res, err = s.refitImageCap(ctx, p, to, path, body, in, res)
@@ -6625,18 +6643,25 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 	body = geminiTypes(body, copilotGemini(p, body))
 	body = kimiLockedSampling(p, to, body)
 	body = clinePin(p, to, body)
-	body = codexImagesFit(p, to, body)
-	// no more images than the model refused more over (image_cap.go)
-	body = s.withinImageCap(p, to, path, body)
+	if !recoveryReplaying(ctx) {
+		body = codexImagesFit(p, to, body)
+		// no more images than the model refused more over (image_cap.go)
+		body = s.withinImageCap(p, to, path, body)
+	}
 	// the tool turns' thinking a provider's model asked for before
 	// (thinking_back.go)
 	body = s.withThinkingBack(p, to, body)
 	// DeepSeek's own API: inline images it holds for this key named by
 	// file id, uploaded once (deepseek_files.go)
-	body, byFile := s.withDeepSeekFiles(reqCtx, p, to, path, body)
+	byFile := false
+	if !recoveryReplaying(ctx) {
+		body, byFile = s.withDeepSeekFiles(reqCtx, p, to, path, body)
+	}
 	// under the byte cap the provider refused a larger request over,
 	// its oldest images left out (body_cap.go)
-	body = s.withinCap(p, to, path, body)
+	if !recoveryReplaying(ctx) {
+		body = s.withinCap(p, to, path, body)
+	}
 	if to == provider.Responses {
 		// whatever the route, Claude's blocks never reach a Responses API
 		body = withoutClaudeSeals(body)
@@ -6735,6 +6760,12 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 			return nil, errors.New("a request to Claude on Vertex AI names no model")
 		}
 		path, body = at, b
+	}
+	if recoveryReplaying(ctx) {
+		if limit := s.bodyCaps.of(p.ID); limit > 0 && len(body) > limit {
+			x, _ := ctx.Value(nativeRecoveryKey{}).(*nativeRecovery)
+			return nil, x.cannotReplay(fmt.Errorf("restored request is %d bytes, provider limit %d", len(body), limit))
+		}
 	}
 	if err := recoveryWireCheck(ctx, to, body); err != nil {
 		return nil, err
