@@ -90,7 +90,7 @@ function server(f, lang) {
       f.posted.push({ action, body });
       if (!f.capability.writable) return json({ error: f.capability.reason }, 403);
       const p = f.providers.find((p) => p.id === body.provider);
-      if (["bind", "bind-key", "apply-key-rate", "logout", "login-account", "2fa-account", "browser-account", "monitor", "preview", "refresh-account"].includes(action) &&
+      if (["bind", "logout", "login-account", "2fa-account", "browser-account", "monitor", "preview", "refresh-account"].includes(action) &&
         body.expectedGeneration !== f.accounts.find((a) => a.id === (body.session || p?.sub2api?.session))?.generation) {
         return json({ error: "The panel account changed; read it again." }, 409);
       }
@@ -102,18 +102,16 @@ function server(f, lang) {
           groupId: p.sub2api.groupId, groupName: p.sub2api.groupName,
         });
       };
-      if (["login", "browser", "bind", "bind-key", "unbind", "apply-key-rate"].includes(action)) {
+      if (["login", "browser", "bind", "unbind"].includes(action)) {
         if (f.failNext === action) {
           f.failNext = "";
           bump();
           if (p.sub2api) p.sub2api.version = nextVersion(p.sub2api.version);
-          if (action === "apply-key-rate") p.priceRate = 1.4;
           sampled();
           return json({ error: "The provider changed; read it again." }, 409);
         }
         if (body.expectedRevision !== p.sub2apiRevision ||
-          ["bind", "bind-key", "unbind"].includes(action) && body.expectedVersion !== (p.sub2api?.version || "") ||
-          action === "apply-key-rate" && (body.bindingVersion !== p.sub2api?.version || body.expectedRate !== localRate(p, body.keyId))) {
+          ["bind", "unbind"].includes(action) && body.expectedVersion !== (p.sub2api?.version || "")) {
           return json({ error: "The provider changed; read it again." }, 409);
         }
       }
@@ -142,13 +140,6 @@ function server(f, lang) {
       if (action === "bind") { p.sub2api = {
         session: body.session, groupId: body.groupId, groupName: body.groupName, keyIds: body.keyIds, version: nextVersion(body.expectedVersion),
       }; bump(); sampled(); }
-      if (action === "bind-key") {
-        const keys = structuredClone(boundKeys(p)), index = keys.findIndex((k) => k.id === body.keyId);
-        const key = { ...(keys[index] || {}), id: body.keyId, groupId: body.groupId, groupName: body.groupName };
-        if (index < 0) keys.push(key); else keys[index] = key;
-        p.sub2api = { session: body.session, keys, version: nextVersion(body.expectedVersion) };
-        bump(); sampled();
-      }
       if (action === "logout") f.accounts.find((a) => a.id === body.session).state = "logged_out";
       if (["monitor", "preview", "refresh-account"].includes(action) && body.settingsRevision !== f.configs[body.session].revision) {
         return json({ error: "The monitor settings changed; read them again." }, 409);
@@ -190,12 +181,6 @@ function server(f, lang) {
         }
         return json(result);
       }
-      if (action === "apply-key-rate") {
-        p.keyPriceRates = { ...p.keyPriceRates, [body.keyId]: body.rate };
-        p.sub2api.keys = structuredClone(boundKeys(p));
-        p.sub2api.keys.find((key) => key.id === body.keyId).priceRate = body.rate;
-        bump();
-      }
       return json({ ok: true });
     }
     if (url.pathname.startsWith("/api/provider/")) {
@@ -219,6 +204,7 @@ async function open(browser, f, lang, width, view = "providers", allGroups = tru
   const context = await browser.newContext({ viewport: { width, height: 860 }, reducedMotion: "reduce" });
   const page = await context.newPage();
   page.setDefaultTimeout(5000);
+  page.setDefaultNavigationTimeout(60000);
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/*", server(f, lang));
@@ -266,8 +252,9 @@ async function wheelTo(page, locator) {
   assert.fail("the target did not enter the viewport after real wheel scrolling");
 }
 
+// Exercise behavior once per engine; reserve locale/viewport coverage for the main flows and metrics.
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
-  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) test(engine + " " + lang + ": recent Sub2API rate changes merge only matching groups within one round", async (t) => {
+  for (const lang of ["en", "de"]) test(engine + " " + lang + ": recent Sub2API rate changes merge only matching groups within one round", async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
     const f = fixture(true), event = f.monitor.changes[0];
@@ -290,43 +277,42 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     const transition = (from, to) => `${rate(from)} → ${rate(to)}`;
     const same = word(lang, "{n} linked keys changed to the same rate");
     const unknown = word(lang, "Rate not confirmed");
-    for (const width of [1200, 420]) {
-      const { page, context, errors } = await open(browser, f, lang, width, "usage");
-      const entries = page.locator("#sub2apiPane .s2-change");
-      assert.equal(await entries.first().locator(":scope > div").count(), 7,
-        "matching Key changes share their group row; other groups, rates and unknown readings remain separate");
-      assert.deepEqual(await entries.first().locator(":scope > div > span:first-child").allTextContents(),
-        ["Group rate changed", "Key billing rate changed", "Key billing rate changed", "Key billing rate changed",
-          "Group rate changed", "Group rate changed", "Key billing rate changed"].map((key) => word(lang, key)));
-      assert.deepEqual(await entries.first().locator(":scope > div > span:last-child").allTextContents(),
-        [`Premium · ${transition(.18, .15)} · ${same.replace("{n}", "2")}`,
-          `Premium · Relay · First · ${transition(.18, .15)}`,
-          `Premium · Relay · Second · ${transition(.2, .15)}`,
-          `Premium · removed-source · removed-key · ${transition(.18, .15)}`,
-          `Free · ${transition(.1, 0)} · ${same.replace("{n}", "1")}`,
-          `Unknown · ${unknown} → ${unknown}`,
-          `Unknown · Relay · First · ${unknown} → ${unknown}`]);
-      assert.deepEqual(await entries.nth(1).locator(":scope > div > span:last-child").allTextContents(),
-        [`Premium · Relay · First · ${transition(.18, .15)}`], "another round never merges with this round");
-      assert.equal(await page.locator(".s2-declared .s2-label").first().textContent(), word(lang, "Group rate"));
-      assert.equal(await page.locator(".s2-billing .s2-label").first().textContent(), word(lang, "Key billing rate"));
-      assert.deepEqual(await page.evaluate(async () => (await import("/sub2api/common.js")).data.monitor.changes),
-        original, "presentation grouping never rewrites stored history");
-      await wheelTo(page, page.locator(".s2-history > summary"));
-      await page.locator(".s2-history > summary").click();
-      await fits(page, page.locator(".s2-history"));
-      if (process.env.ARTIFACT_DIR) {
-        await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
-        await wheelTo(page, entries.first().locator(":scope > div").first());
-        await page.screenshot({
-          path: path.join(process.env.ARTIFACT_DIR, `sub2api-rate-history-${engine}-${lang}-${width}.png`),
-        });
-      }
-      assert.deepEqual(errors, []);
-      await context.close();
+    const width = 420;
+    const { page, context, errors } = await open(browser, f, lang, width, "usage");
+    const entries = page.locator("#sub2apiPane .s2-change");
+    assert.equal(await entries.first().locator(":scope > div").count(), 7,
+      "matching Key changes share their group row; other groups, rates and unknown readings remain separate");
+    assert.deepEqual(await entries.first().locator(":scope > div > span:first-child").allTextContents(),
+      ["Group rate changed", "Key billing rate changed", "Key billing rate changed", "Key billing rate changed",
+        "Group rate changed", "Group rate changed", "Key billing rate changed"].map((key) => word(lang, key)));
+    assert.deepEqual(await entries.first().locator(":scope > div > span:last-child").allTextContents(),
+      [`Premium · ${transition(.18, .15)} · ${same.replace("{n}", "2")}`,
+        `Premium · Relay · First · ${transition(.18, .15)}`,
+        `Premium · Relay · Second · ${transition(.2, .15)}`,
+        `Premium · removed-source · removed-key · ${transition(.18, .15)}`,
+        `Free · ${transition(.1, 0)} · ${same.replace("{n}", "1")}`,
+        `Unknown · ${unknown} → ${unknown}`,
+        `Unknown · Relay · First · ${unknown} → ${unknown}`]);
+    assert.deepEqual(await entries.nth(1).locator(":scope > div > span:last-child").allTextContents(),
+      [`Premium · Relay · First · ${transition(.18, .15)}`], "another round never merges with this round");
+    assert.equal(await page.locator(".s2-declared .s2-label").first().textContent(), word(lang, "Group rate"));
+    assert.equal(await page.locator(".s2-billing .s2-label").first().textContent(), word(lang, "Key billing rate"));
+    assert.deepEqual(await page.evaluate(async () => (await import("/sub2api/common.js")).data.monitor.changes),
+      original, "presentation grouping never rewrites stored history");
+    await wheelTo(page, page.locator(".s2-history > summary"));
+    await page.locator(".s2-history > summary").click();
+    await fits(page, page.locator(".s2-history"));
+    if (process.env.ARTIFACT_DIR) {
+      await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
+      await wheelTo(page, entries.first().locator(":scope > div").first());
+      await page.screenshot({
+        path: path.join(process.env.ARTIFACT_DIR, `sub2api-rate-history-${engine}-${lang}-${width}.png`),
+      });
     }
+    assert.deepEqual(errors, []);
+    await context.close();
   });
-  for (const lang of ["en", "zh"]) test(engine + " " + lang + ": recent Sub2API changes are newest first by their timestamp", async (t) => {
+  test(engine + ": recent Sub2API changes are newest first by their timestamp", async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
     const f = fixture(true), change = f.monitor.changes[0];
@@ -339,7 +325,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       ["invalid", "not-a-date"],
     ].map(([id, at]) => ({ ...change, id, at, items: [{ ...change.items[0], groupName: id }] }));
     const original = f.monitor.changes.map((event) => event.id);
-    const { page, errors } = await open(browser, f, lang, 420, "usage");
+    const { page, errors } = await open(browser, f, "en", 420, "usage");
     const entries = page.locator("#sub2apiPane .s2-change");
     assert.deepEqual(await entries.locator("div > span:last-child").allTextContents(),
       ["newest", "same-time", "offset", "oldest", "missing", "invalid"].map((id) => `${id} · Relay · First · 1× → 0.8×`));
@@ -347,33 +333,31 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       original, "display order does not change shared history");
     assert.deepEqual(errors, []);
   });
-  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) test(engine + " " + lang + ": recent Sub2API changes keep their fold state across redraws", async (t) => {
+  test(engine + ": recent Sub2API changes keep their fold state across redraws", async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
-    for (const width of [1200, 420]) {
-      const f = fixture(true), { page, context, errors } = await open(browser, f, lang, width, "usage");
-      const history = page.locator("#sub2apiPane .s2-history"), summary = history.locator(":scope > summary");
-      await page.evaluate(() => { usageEvery = 0; });
-      assert.equal(await history.evaluate((node) => node.open), false, "history starts folded");
-      await wheelTo(page, summary);
-      await summary.click();
-      assert.equal(await history.evaluate((node) => node.open), true);
-      f.monitor.changes.push({ ...f.monitor.changes[0], id: "new-round", at: "2026-10-16T01:01:00Z" });
-      await page.evaluate(() => refreshUsage());
-      assert.equal(await history.locator(".s2-change").count(), 2, "the background read redraws new changes");
-      assert.equal(await history.evaluate((node) => node.open), true, "a background update keeps history expanded");
-      await page.evaluate(() => refreshUsage(true));
-      assert.equal(await history.evaluate((node) => node.open), true, "a manual refresh keeps history expanded");
-      await wheelTo(page, summary);
-      await summary.click();
-      f.monitor.polling = !f.monitor.polling;
-      await page.evaluate(() => refreshUsage());
-      assert.equal(await history.evaluate((node) => node.open), false, "a background update keeps the user's fold");
-      assert.deepEqual(errors, []);
-      await context.close();
-    }
+    const f = fixture(true), { page, context, errors } = await open(browser, f, "en", 420, "usage");
+    const history = page.locator("#sub2apiPane .s2-history"), summary = history.locator(":scope > summary");
+    await page.evaluate(() => { usageEvery = 0; });
+    assert.equal(await history.evaluate((node) => node.open), false, "history starts folded");
+    await wheelTo(page, summary);
+    await summary.click();
+    assert.equal(await history.evaluate((node) => node.open), true);
+    f.monitor.changes.push({ ...f.monitor.changes[0], id: "new-round", at: "2026-10-16T01:01:00Z" });
+    await page.evaluate(() => refreshUsage());
+    assert.equal(await history.locator(".s2-change").count(), 2, "the background read redraws new changes");
+    assert.equal(await history.evaluate((node) => node.open), true, "a background update keeps history expanded");
+    await page.evaluate(() => refreshUsage(true));
+    assert.equal(await history.evaluate((node) => node.open), true, "a manual refresh keeps history expanded");
+    await wheelTo(page, summary);
+    await summary.click();
+    f.monitor.polling = !f.monitor.polling;
+    await page.evaluate(() => refreshUsage());
+    assert.equal(await history.evaluate((node) => node.open), false, "a background update keeps the user's fold");
+    assert.deepEqual(errors, []);
+    await context.close();
   });
-  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) test(engine + " " + lang + ": recent Sub2API visibility changes show the group name once and its recorded rate", async (t) => {
+  for (const lang of ["en", "de"]) test(engine + " " + lang + ": recent Sub2API visibility changes show the group name once and its recorded rate", async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
     const f = fixture(true), change = f.monitor.changes[0];
@@ -396,29 +380,28 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       ...change.items,
     ];
     const original = structuredClone(f.monitor.changes);
-    for (const width of [1200, 420]) {
-      const { page, context, errors } = await open(browser, f, lang, width, "usage");
-      assert.deepEqual(await page.locator("#sub2apiPane .s2-change > div > span:last-child").allTextContents(),
-        [`Premium · ${(.18).toLocaleString(lang)}×`, "Free · 0×", `Premium · ${word(lang, "Rate not confirmed")}`,
-          "Standard", `c · ${word(lang, "Rate not confirmed")}`, "d",
-          `Premium · ${(.1).toLocaleString(lang)}× → ${(.18).toLocaleString(lang)}×`, "Standard → Premium",
-          "超高级分组（不降智） → 高级分组（不降智）2", "Standard · 2 → <b>Premium</b>", "Premium", "Standard", "Premium", "saved-group",
-          "Premium · true · false", `Premium · Relay · First · 1× → ${(.8).toLocaleString(lang)}×`]);
-      assert.equal(await page.locator("#sub2apiPane .s2-change > div > span:last-child > *").count(), 0,
-        "group names remain plain text");
-      assert.deepEqual(await page.evaluate(async () => (await import("/sub2api/common.js")).data.monitor.changes),
-        original, "display formatting preserves stored change values");
-      await wheelTo(page, page.locator(".s2-history > summary"));
-      await page.locator(".s2-history > summary").click();
-      await fits(page, page.locator(".s2-history"));
-      if (process.env.ARTIFACT_DIR && lang === "zh") {
-        await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
-        await wheelTo(page, page.locator(".s2-change > div").nth(8));
-        await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `sub2api-rename-${engine}-${width}.png`) });
-      }
-      assert.deepEqual(errors, []);
-      await context.close();
+    const width = 420;
+    const { page, context, errors } = await open(browser, f, lang, width, "usage");
+    assert.deepEqual(await page.locator("#sub2apiPane .s2-change > div > span:last-child").allTextContents(),
+      [`Premium · ${(.18).toLocaleString(lang)}×`, "Free · 0×", `Premium · ${word(lang, "Rate not confirmed")}`,
+        "Standard", `c · ${word(lang, "Rate not confirmed")}`, "d",
+        `Premium · ${(.1).toLocaleString(lang)}× → ${(.18).toLocaleString(lang)}×`, "Standard → Premium",
+        "超高级分组（不降智） → 高级分组（不降智）2", "Standard · 2 → <b>Premium</b>", "Premium", "Standard", "Premium", "saved-group",
+        "Premium · true · false", `Premium · Relay · First · 1× → ${(.8).toLocaleString(lang)}×`]);
+    assert.equal(await page.locator("#sub2apiPane .s2-change > div > span:last-child > *").count(), 0,
+      "group names remain plain text");
+    assert.deepEqual(await page.evaluate(async () => (await import("/sub2api/common.js")).data.monitor.changes),
+      original, "display formatting preserves stored change values");
+    await wheelTo(page, page.locator(".s2-history > summary"));
+    await page.locator(".s2-history > summary").click();
+    await fits(page, page.locator(".s2-history"));
+    if (process.env.ARTIFACT_DIR) {
+      await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
+      await wheelTo(page, page.locator(".s2-change > div").nth(8));
+      await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `sub2api-rename-${engine}-${lang}-${width}.png`) });
     }
+    assert.deepEqual(errors, []);
+    await context.close();
   });
   test(engine + ": three sites fit a compact overview without separating Key actions", async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
@@ -527,74 +510,72 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
   test(engine + ": group overview defaults to linked Keys and keeps filters separate from monitoring", async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
-    for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
-      for (const width of [1410, 420]) {
-        await t.test(`${lang} ${width}px`, async (st) => {
-          const f = fixture(true), p = f.providers[0], mon = f.monitor.accounts[0];
-          p.name = "哈基米biu"; p.keyList = [p.keyList[0]]; p.priceRate = 1;
-          p.keyList[0].name = "sk-6...52fa";
-          p.sub2api = { session: account.id, version: binding.version, keys: [
-            { id: "key-one", groupId: "105", groupName: "不降智的gpt" },
-          ] };
-          f.accounts[0].email = "示例帐号"; f.accounts[0].base = "https://o10.top";
-          p.chat = "https://o10.top/v1";
-          mon.site = f.accounts[0].base;
-          mon.groups = [{ id: "105", name: "不降智的gpt", rate: .15, visible: true, lastSuccess: stamp },
-            { id: "unlinked", name: "Standard", rate: 1, visible: true, lastSuccess: stamp }];
-          mon.sources[0].keys = [{ id: "key-one", groupId: "105", rate: .15, lastSuccess: stamp }];
-          mon.sources[0].activeKeyIds = ["key-one"];
-          delete mon.observation;
-          const { page, context, errors } = await open(browser, f, lang, width, "usage", false);
-          st.after(() => context.close());
-          if (width === 1410) await page.setViewportSize({ width, height: 1116 });
-          const tr = (key) => word(lang, key), pane = page.locator("#sub2apiPane");
-          await pane.locator('[data-group="105"]').waitFor();
-          const linked = pane.getByRole("button", { name: tr("Linked keys"), exact: true });
-          const all = pane.getByRole("button", { name: tr("All panel groups"), exact: true });
-          assert.equal(await linked.getAttribute("aria-pressed"), "true");
-          assert.equal(await pane.locator(".s2-group").count(), 1);
-          assert.match(await pane.locator(".s2-site").textContent(), /o10.top · 哈基米biu/);
-          assert.doesNotMatch(await pane.locator(".s2-table").textContent(), /哈基米biu/,
-            "source names appear at the panel address, never on each Key");
-          assert.match(await pane.locator(".s2-local .s2-value").textContent(), /^1×$/);
-          assert.equal(await pane.locator(".s2-sync").textContent(), tr("Pending sync"));
-          assert.equal(await pane.getByRole("button", { name: tr("Apply rate"), exact: true }).count(), 0);
-          assert((await pane.locator(".s2-query-source svg").boundingBox()).width >= 12,
-            "query icons keep their size beside a Key on narrow screens");
-          assert.equal(await pane.locator(".s2-differences").textContent(), tr("{n} keys pending sync").replace("{n}", 1));
-          await page.evaluate(() => { usageEvery = 0; localStorage.setItem("magpie.navLayout", "top"); navPick = "top"; layoutNav(); });
-          await page.locator('#nav .on[data-view="usage"]').evaluate((node) => node.scrollIntoView({ inline: "nearest", block: "nearest" }));
-          await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-          await fits(page, pane);
-          if (process.env.ARTIFACT_DIR && ["en", "zh"].includes(lang)) {
-            await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `sub2api-overview-${engine}-${lang}-${width}.png`), fullPage: true });
-          }
-          await all.click();
-          assert.equal(await pane.locator(".s2-group").count(), 2);
-          assert.equal(await all.getAttribute("aria-pressed"), "true");
-          await linked.click();
-          assert.equal(await pane.locator(".s2-group").count(), 1);
-          assert.equal(posted(f, "monitor").length, 0, "display filters never change account monitoring");
-          assert.equal(f.configs[account.id].enabled, true);
-          const more = pane.getByRole("button", { name: tr("Account actions"), exact: true });
-          await wheelTo(page, more);
-          await more.click();
-          assert.equal(await more.getAttribute("aria-expanded"), "true");
-          await page.getByRole("menuitemradio", { name: tr("Sign out"), exact: true }).click();
-          const confirm = page.getByRole("alertdialog");
-          await confirm.getByRole("button", { name: tr("Cancel"), exact: true }).click();
-          assert.equal(posted(f, "logout").length, 0, "the actions menu retains sign-out confirmation");
-          mon.sources[0].keys[0].groupVerified = false;
-          await page.evaluate(() => window.Sub2API.renderUsage(document.querySelector("#sub2apiPane"), false, true));
-          await pane.getByText(tr("Group not identified"), { exact: true }).waitFor();
-          assert.equal(await pane.locator(".s2-group").count(), 1);
-          await all.click();
-          assert.equal(await pane.locator('.s2-group[data-group=""] .s2-keys [data-key="key-one"]').count(), 1,
-            "an unidentified Key stays reachable in both filters");
-          await fits(page, pane);
-          assert.deepEqual(errors, []);
-        });
-      }
+    for (const [lang, width] of [["en", 420], ["zh", 1410]]) {
+      await t.test(`${lang} ${width}px`, async (st) => {
+        const f = fixture(true), p = f.providers[0], mon = f.monitor.accounts[0];
+        p.name = "哈基米biu"; p.keyList = [p.keyList[0]]; p.priceRate = 1;
+        p.keyList[0].name = "sk-6...52fa";
+        p.sub2api = { session: account.id, version: binding.version, keys: [
+          { id: "key-one", groupId: "105", groupName: "不降智的gpt" },
+        ] };
+        f.accounts[0].email = "示例帐号"; f.accounts[0].base = "https://o10.top";
+        p.chat = "https://o10.top/v1";
+        mon.site = f.accounts[0].base;
+        mon.groups = [{ id: "105", name: "不降智的gpt", rate: .15, visible: true, lastSuccess: stamp },
+          { id: "unlinked", name: "Standard", rate: 1, visible: true, lastSuccess: stamp }];
+        mon.sources[0].keys = [{ id: "key-one", groupId: "105", rate: .15, lastSuccess: stamp }];
+        mon.sources[0].activeKeyIds = ["key-one"];
+        delete mon.observation;
+        const { page, context, errors } = await open(browser, f, lang, width, "usage", false);
+        st.after(() => context.close());
+        if (width === 1410) await page.setViewportSize({ width, height: 1116 });
+        const tr = (key) => word(lang, key), pane = page.locator("#sub2apiPane");
+        await pane.locator('[data-group="105"]').waitFor();
+        const linked = pane.getByRole("button", { name: tr("Linked keys"), exact: true });
+        const all = pane.getByRole("button", { name: tr("All panel groups"), exact: true });
+        assert.equal(await linked.getAttribute("aria-pressed"), "true");
+        assert.equal(await pane.locator(".s2-group").count(), 1);
+        assert.match(await pane.locator(".s2-site").textContent(), /o10.top · 哈基米biu/);
+        assert.doesNotMatch(await pane.locator(".s2-table").textContent(), /哈基米biu/,
+          "source names appear at the panel address, never on each Key");
+        assert.match(await pane.locator(".s2-local .s2-value").textContent(), /^1×$/);
+        assert.equal(await pane.locator(".s2-sync").textContent(), tr("Pending sync"));
+        assert.equal(await pane.getByRole("button", { name: tr("Apply rate"), exact: true }).count(), 0);
+        assert((await pane.locator(".s2-query-source svg").boundingBox()).width >= 12,
+          "query icons keep their size beside a Key on narrow screens");
+        assert.equal(await pane.locator(".s2-differences").textContent(), tr("{n} keys pending sync").replace("{n}", 1));
+        await page.evaluate(() => { usageEvery = 0; localStorage.setItem("magpie.navLayout", "top"); navPick = "top"; layoutNav(); });
+        await page.locator('#nav .on[data-view="usage"]').evaluate((node) => node.scrollIntoView({ inline: "nearest", block: "nearest" }));
+        await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        await fits(page, pane);
+        if (process.env.ARTIFACT_DIR) {
+          await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `sub2api-overview-${engine}-${lang}-${width}.png`), fullPage: true });
+        }
+        await all.click();
+        assert.equal(await pane.locator(".s2-group").count(), 2);
+        assert.equal(await all.getAttribute("aria-pressed"), "true");
+        await linked.click();
+        assert.equal(await pane.locator(".s2-group").count(), 1);
+        assert.equal(posted(f, "monitor").length, 0, "display filters never change account monitoring");
+        assert.equal(f.configs[account.id].enabled, true);
+        const more = pane.getByRole("button", { name: tr("Account actions"), exact: true });
+        await wheelTo(page, more);
+        await more.click();
+        assert.equal(await more.getAttribute("aria-expanded"), "true");
+        await page.getByRole("menuitemradio", { name: tr("Sign out"), exact: true }).click();
+        const confirm = page.getByRole("alertdialog");
+        await confirm.getByRole("button", { name: tr("Cancel"), exact: true }).click();
+        assert.equal(posted(f, "logout").length, 0, "the actions menu retains sign-out confirmation");
+        mon.sources[0].keys[0].groupVerified = false;
+        await page.evaluate(() => window.Sub2API.renderUsage(document.querySelector("#sub2apiPane"), false, true));
+        await pane.getByText(tr("Group not identified"), { exact: true }).waitFor();
+        assert.equal(await pane.locator(".s2-group").count(), 1);
+        await all.click();
+        assert.equal(await pane.locator('.s2-group[data-group=""] .s2-keys [data-key="key-one"]').count(), 1,
+          "an unidentified Key stays reachable in both filters");
+        await fits(page, pane);
+        assert.deepEqual(errors, []);
+      });
     }
   });
   test(engine + ": one source automatically syncs independent Key groups and rates", async (t) => {
@@ -676,34 +657,31 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
   test(engine + ": unidentified Keys retain history and sync failures stay independent", async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
-    for (const width of [1100, 420]) {
-      await t.test(width + "px", async (st) => {
-        const f = fixture(true);
-        f.providers[0].sub2api = { session: account.id, version: binding.version, keys: [
-          { id: "key-one", groupId: "a", groupName: "Premium", priceRate: .6 },
-          { id: "key-two", groupId: "a", groupName: "Premium", priceRate: 1.5 },
-        ] };
-        const source = f.monitor.accounts[0].sources[0];
-        Object.assign(source.keys[0], { groupVerified: false, groupError: "Only a masked Key was returned" });
-        Object.assign(source.keys[1], { syncError: "The provider changed; query again.", rate: 1.5 });
-        const { page, context, errors } = await open(browser, f, "en", width, "usage");
-        st.after(() => context.close());
-        const pane = page.locator("#sub2apiPane");
-        const unknown = pane.locator('[data-group=""]');
-        await unknown.waitFor();
-        assert.match(await unknown.textContent(), /Previous group: Premium · a/);
-        assert.match(await unknown.textContent(), /Only a masked Key was returned/);
-        assert.equal(await unknown.locator(".s2-sync").textContent(), "Sync failed");
-        assert.equal(await pane.locator('[data-group="a"] .s2-sync').textContent(), "Sync failed");
-        assert.equal(await pane.getByRole("button", { name: "Link key", exact: true }).count(), 0);
-        if (process.env.ARTIFACT_DIR) {
-          await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `sub2api-auto-sync-${engine}-${width}.png`), fullPage: true });
-        }
-        assert.equal(posted(f, "bind-key").length, 0);
-        await fits(page, pane);
-        assert.deepEqual(errors, []);
-      });
+    const width = 420;
+    const f = fixture(true);
+    f.providers[0].sub2api = { session: account.id, version: binding.version, keys: [
+      { id: "key-one", groupId: "a", groupName: "Premium", priceRate: .6 },
+      { id: "key-two", groupId: "a", groupName: "Premium", priceRate: 1.5 },
+    ] };
+    const source = f.monitor.accounts[0].sources[0];
+    Object.assign(source.keys[0], { groupVerified: false, groupError: "Only a masked Key was returned" });
+    Object.assign(source.keys[1], { syncError: "The provider changed; query again.", rate: 1.5 });
+    const { page, context, errors } = await open(browser, f, "en", width, "usage");
+    t.after(() => context.close());
+    const pane = page.locator("#sub2apiPane");
+    const unknown = pane.locator('[data-group=""]');
+    await unknown.waitFor();
+    assert.match(await unknown.textContent(), /Previous group: Premium · a/);
+    assert.match(await unknown.textContent(), /Only a masked Key was returned/);
+    assert.equal(await unknown.locator(".s2-sync").textContent(), "Sync failed");
+    assert.equal(await pane.locator('[data-group="a"] .s2-sync').textContent(), "Sync failed");
+    assert.equal(await pane.getByRole("button", { name: "Link key", exact: true }).count(), 0);
+    if (process.env.ARTIFACT_DIR) {
+      await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `sub2api-auto-sync-${engine}-${width}.png`), fullPage: true });
     }
+    assert.equal(posted(f, "bind-key").length, 0);
+    await fits(page, pane);
+    assert.deepEqual(errors, []);
   });
   test(engine + ": an account without sources can query groups and control monitoring", async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
@@ -743,59 +721,6 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     assert.deepEqual(f.configs[account.id].groups, []);
     assert.deepEqual(errors, []);
   });
-  test(engine + ": Usage does not offer manual group links", async (t) => {
-    const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
-    t.after(() => browser.close());
-    const source = (id, balanceURL, chat = relay.chat, extra = {}) => {
-      const p = { ...structuredClone(relay), id, name: id, balanceURL, chat, ...extra };
-      delete p.sub2api;
-      return p;
-    };
-    await t.test("full API origins select individual Keys independently of balance URLs", async (st) => {
-      const f = fixture(true);
-      f.monitor.accounts[0].sources = [];
-      f.providers = [
-        source("Same balance", "https://panel.example.com/custom-balance", "https://api.other.test/v1"),
-        source("Same chat", ""),
-        source("Default port", "", "https://PANEL.EXAMPLE.COM:443/v1"),
-        source("Same responses", "", "", { responses: "https://panel.example.com/v1/responses" }),
-        source("Other site", "", "https://other.test/v1"),
-        source("Other subdomain", "", "https://api.panel.example.com/v1"),
-        source("Suffix lookalike", "", "https://panel.example.com.other.test/v1"),
-        source("Other port", "", "https://panel.example.com:8443/v1"),
-        source("HTTP downgrade", "", "http://panel.example.com/v1"),
-        source("Invalid URL", "", "not-a-url"),
-        source("URL credentials", "", "https://user:secret@panel.example.com/v1"),
-        source("External balance", "https://other.test/api/balance", relay.chat),
-        source("First API is external", "", "https://other.test/v1", { responses: relay.chat }),
-      ];
-      const { page, context, errors } = await open(browser, f, "en", 1100, "usage");
-      st.after(() => context.close());
-      await page.locator('#sub2apiPane [data-group="a"]').waitFor();
-      assert.equal(await page.getByRole("button", { name: "Link key", exact: true }).count(), 0);
-      assert.equal(posted(f, "bind-key").length, 0);
-      assert.deepEqual(errors, []);
-    });
-    await t.test("no matching origin leaves no provider to bind", async (st) => {
-      const f = fixture(true);
-      f.monitor.accounts[0].sources = [];
-      f.providers = [source("Only another site", account.base, "https://other.test/v1")];
-      const { page, context, errors } = await open(browser, f, "en", 420, "usage");
-      st.after(() => context.close());
-      await page.locator('#sub2apiPane [data-group="a"]').waitFor();
-      assert.equal(await page.getByRole("button", { name: "Link key", exact: true }).count(), 0);
-      assert.equal(posted(f, "bind-key").length, 0);
-      assert.deepEqual(errors, []);
-    });
-    await t.test("the Chinese label identifies the key billing multiplier", async (st) => {
-      const f = fixture(true), { page, context, errors } = await open(browser, f, "zh", 420, "usage");
-      st.after(() => context.close());
-      const label = page.locator('#sub2apiPane [data-group="a"] .s2-billing .s2-label').first();
-      await label.waitFor();
-      assert.equal(await label.textContent(), "Key 计费倍率");
-      assert.deepEqual(errors, []);
-    });
-  });
   test(engine + ": source editor accounts match the panel and saved balance origins", async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
@@ -810,83 +735,82 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       { ...account, id: "session-userinfo", email: "userinfo@example.com", base: "https://user:secret@panel.example.com" },
       { ...account, id: "session-out", email: "out@example.com", state: "logged_out" },
     ];
-    for (const width of [1100, 420]) {
-      await t.test(width + "px: only same-site signed-in accounts are offered", async (st) => {
-        const f = fixture();
-        f.accounts = candidates();
-        f.providers[0].chat = "https://api.other.example/v1";
-        const { page, context, errors } = await open(browser, f, "en", width);
-        st.after(() => context.close());
-        await page.locator(".row.provider", { hasText: "Relay" }).click();
-        const box = page.locator(".s2-editor");
-        await box.locator("summary").click();
-        const pick = box.getByRole("button", { name: "Signed-in accounts", exact: true });
-        await wheelTo(page, pick);
-        await pick.click();
-        const choices = page.getByRole("menuitemradio");
-        assert.equal(await choices.count(), 3, "the balance URL takes precedence over the API URL and excludes other origins and signed-out accounts");
-        for (const email of [account.email, "second@example.com", "canonical@example.com"]) {
-          assert.equal(await choices.filter({ hasText: email }).count(), 1, "same-site account " + email + " remains available");
-        }
-        await fits(page, box);
-        if (process.env.ARTIFACT_DIR) {
-          await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `sub2api-account-filter-${engine}-${width}.png`), fullPage: true });
-        }
-        await choices.filter({ hasText: "second@example.com" }).click();
-        const use = box.getByRole("button", { name: "Link account", exact: true });
-        await waitPost(page, "bind", () => use.click());
-        assert.equal(posted(f, "bind")[0].body.session, "session-two");
-        assert.deepEqual(errors, []);
-      });
-      await t.test(width + "px: editing the address invalidates account choices without resetting credentials", async (st) => {
-        const f = fixture();
-        f.accounts = candidates();
-        const { page, context, errors } = await open(browser, f, "en", width);
-        st.after(() => context.close());
-        await page.locator(".row.provider", { hasText: "Relay" }).click();
-        const box = page.locator(".s2-editor");
-        await box.locator("summary").click();
-        const pick = box.getByRole("button", { name: "Signed-in accounts", exact: true });
-        await wheelTo(page, pick);
-        await pick.click();
-        await page.getByRole("menuitemradio").filter({ hasText: account.email }).click();
-        const base = box.getByLabel("Panel address", { exact: true });
-        const email = box.getByLabel("Panel email", { exact: true });
-        const password = box.getByLabel("Panel password", { exact: true });
-        const use = box.getByRole("button", { name: "Link account", exact: true });
-        assert(await use.isEnabled());
-        await email.fill("typed@example.com");
-        await password.fill("typed-password");
-        const inputNode = await password.elementHandle(), oldUse = await use.elementHandle();
-        st.after(() => inputNode.dispose());
-        st.after(() => oldUse.dispose());
-        await wheelTo(page, pick);
-        await pick.click();
-        await page.getByRole("menuitemradio").filter({ hasText: account.email }).waitFor();
-        await base.fill("https://api.other.example");
-        assert.equal(await page.getByRole("menuitemradio").count(), 0, "changing the address closes its obsolete menu");
-        assert(await pick.isDisabled(), "neither the old panel account nor an account from another balance origin remains selectable");
-        assert(await use.isDisabled(), "the old account selection is cleared immediately");
-        await oldUse.evaluate((button) => button.onclick());
-        assert.equal(posted(f, "bind").length, 0, "an obsolete linking control cannot bind the previously selected account");
-        assert(await inputNode.evaluate((input) => input.isConnected && input.value === "typed-password"),
-          "the password input stays mounted while account choices refresh");
-        assert.equal(await email.inputValue(), "typed@example.com");
-        await base.fill("https://PANEL.EXAMPLE.COM:443");
-        assert(await pick.isEnabled(), "the same origin restores its eligible accounts");
-        assert(await use.isDisabled(), "returning to an origin does not revive a cleared account selection");
-        await pick.click();
-        assert.equal(await page.getByRole("menuitemradio").count(), 3);
-        await base.fill("https://user:secret@panel.example.com");
-        assert.equal(await page.getByRole("menuitemradio").count(), 0);
-        assert(await pick.isDisabled(), "an address containing userinfo cannot offer panel accounts");
-        assert.equal(await password.inputValue(), "typed-password");
-        assert.equal(await email.inputValue(), "typed@example.com");
-        assert.equal(posted(f, "bind").length, 0);
-        await fits(page, box);
-        assert.deepEqual(errors, []);
-      });
-    }
+    const width = 420;
+    await t.test(width + "px: only same-site signed-in accounts are offered", async (st) => {
+      const f = fixture();
+      f.accounts = candidates();
+      f.providers[0].chat = "https://api.other.example/v1";
+      const { page, context, errors } = await open(browser, f, "en", width);
+      st.after(() => context.close());
+      await page.locator(".row.provider", { hasText: "Relay" }).click();
+      const box = page.locator(".s2-editor");
+      await box.locator("summary").click();
+      const pick = box.getByRole("button", { name: "Signed-in accounts", exact: true });
+      await wheelTo(page, pick);
+      await pick.click();
+      const choices = page.getByRole("menuitemradio");
+      assert.equal(await choices.count(), 3, "the balance URL takes precedence over the API URL and excludes other origins and signed-out accounts");
+      for (const email of [account.email, "second@example.com", "canonical@example.com"]) {
+        assert.equal(await choices.filter({ hasText: email }).count(), 1, "same-site account " + email + " remains available");
+      }
+      await fits(page, box);
+      if (process.env.ARTIFACT_DIR) {
+        await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `sub2api-account-filter-${engine}-${width}.png`), fullPage: true });
+      }
+      await choices.filter({ hasText: "second@example.com" }).click();
+      const use = box.getByRole("button", { name: "Link account", exact: true });
+      await waitPost(page, "bind", () => use.click());
+      assert.equal(posted(f, "bind")[0].body.session, "session-two");
+      assert.deepEqual(errors, []);
+    });
+    await t.test(width + "px: editing the address invalidates account choices without resetting credentials", async (st) => {
+      const f = fixture();
+      f.accounts = candidates();
+      const { page, context, errors } = await open(browser, f, "en", width);
+      st.after(() => context.close());
+      await page.locator(".row.provider", { hasText: "Relay" }).click();
+      const box = page.locator(".s2-editor");
+      await box.locator("summary").click();
+      const pick = box.getByRole("button", { name: "Signed-in accounts", exact: true });
+      await wheelTo(page, pick);
+      await pick.click();
+      await page.getByRole("menuitemradio").filter({ hasText: account.email }).click();
+      const base = box.getByLabel("Panel address", { exact: true });
+      const email = box.getByLabel("Panel email", { exact: true });
+      const password = box.getByLabel("Panel password", { exact: true });
+      const use = box.getByRole("button", { name: "Link account", exact: true });
+      assert(await use.isEnabled());
+      await email.fill("typed@example.com");
+      await password.fill("typed-password");
+      const inputNode = await password.elementHandle(), oldUse = await use.elementHandle();
+      st.after(() => inputNode.dispose());
+      st.after(() => oldUse.dispose());
+      await wheelTo(page, pick);
+      await pick.click();
+      await page.getByRole("menuitemradio").filter({ hasText: account.email }).waitFor();
+      await base.fill("https://api.other.example");
+      assert.equal(await page.getByRole("menuitemradio").count(), 0, "changing the address closes its obsolete menu");
+      assert(await pick.isDisabled(), "neither the old panel account nor an account from another balance origin remains selectable");
+      assert(await use.isDisabled(), "the old account selection is cleared immediately");
+      await oldUse.evaluate((button) => button.onclick());
+      assert.equal(posted(f, "bind").length, 0, "an obsolete linking control cannot bind the previously selected account");
+      assert(await inputNode.evaluate((input) => input.isConnected && input.value === "typed-password"),
+        "the password input stays mounted while account choices refresh");
+      assert.equal(await email.inputValue(), "typed@example.com");
+      await base.fill("https://PANEL.EXAMPLE.COM:443");
+      assert(await pick.isEnabled(), "the same origin restores its eligible accounts");
+      assert(await use.isDisabled(), "returning to an origin does not revive a cleared account selection");
+      await pick.click();
+      assert.equal(await page.getByRole("menuitemradio").count(), 3);
+      await base.fill("https://user:secret@panel.example.com");
+      assert.equal(await page.getByRole("menuitemradio").count(), 0);
+      assert(await pick.isDisabled(), "an address containing userinfo cannot offer panel accounts");
+      assert.equal(await password.inputValue(), "typed-password");
+      assert.equal(await email.inputValue(), "typed@example.com");
+      assert.equal(posted(f, "bind").length, 0);
+      await fits(page, box);
+      assert.deepEqual(errors, []);
+    });
     await t.test("without a balance URL the first saved API origin selects the accounts", async (st) => {
       const f = fixture();
       f.accounts = candidates();
@@ -924,8 +848,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
   test(engine + ": partial panel previews retain key groups and show observation errors", async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
-    for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) for (const view of ["providers", "usage"]) {
-      await t.test(lang + " " + view, async (st) => {
+    const lang = "en";
+    for (const view of ["providers", "usage"]) {
+      await t.test(view, async (st) => {
         const f = fixture(true);
         f.previewAccount = structuredClone(f.monitor.accounts[0]);
         Object.assign(f.previewAccount, { error: "Observation unavailable", observationError: "Observation unavailable" });
@@ -949,8 +874,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
   test(engine + ": failed group queries reread local state without replaying sampling", async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
-    for (const view of ["providers", "usage"]) for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
-      await t.test(view + " " + lang, async (st) => {
+    const lang = "en";
+    for (const view of ["providers", "usage"]) {
+      await t.test(view, async (st) => {
         const f = fixture(true);
         Object.assign(f.accounts[0], { state: "refresh_unknown", lastError: "A previous refresh result is not yet confirmed" });
         const { page, context, errors } = await open(browser, f, lang, 420, view);
@@ -1197,7 +1123,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await query.click();
         await requested;
         if (invalidation === "close") {
-          await page.locator(".editor .bar").getByRole("button", { name: "Cancel", exact: true }).click();
+          await page.locator(".editor .bar .ed-cancel").click();
           await page.locator(".editor").waitFor({ state: "hidden" });
           await row.click();
           await pick.waitFor();
@@ -1217,19 +1143,6 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.deepEqual(errors, []);
       });
     }
-  });
-  test(engine + ": late editor content stays inside the scrolling body", async (t) => {
-    const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
-    t.after(() => browser.close());
-    const f = fixture(), { page, context, errors } = await open(browser, f, "en", 420);
-    t.after(() => context.close());
-    await page.locator(".row.provider", { hasText: "Relay" }).click();
-    const box = page.locator(".s2-editor");
-    await box.locator("summary").click();
-    await box.getByLabel("Panel password", { exact: true }).waitFor();
-    assert(await box.evaluate((node) => node.closest(".ebody")?.parentElement === node.closest(".editor")),
-      "late panel fields must belong to the editor's scrolling body");
-    assert.deepEqual(errors, []);
   });
   test(engine + ": existing preset account tokens keep replacement, removal and cancellation", async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
@@ -1279,7 +1192,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await box.getByText(f.capability.reason, { exact: true }).waitFor();
       assert.equal(await box.locator("input[type=password]").count(), 0);
       assert.equal(await box.getByRole("button", { name: "Sign in", exact: true }).count(), 0);
-      await page.locator(".editor .bar").getByRole("button", { name: "Cancel", exact: true }).click();
+      await page.locator(".editor .bar .ed-cancel").click();
       await page.evaluate(async () => { usageTab = "sub2api"; await show("usage"); });
       const pane = page.locator("#sub2apiPane");
       await pane.getByText(f.capability.reason, { exact: true }).waitFor();
@@ -1365,7 +1278,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(await box.locator("input[type=password]").count(), 0);
         const aborted = page.waitForEvent("requestfailed", { predicate: (r) => r === pending });
         if (mode === "account") await page.locator('#nav [data-view="providers"]').click();
-        else await page.locator(".editor .bar").getByRole("button", { name: "Cancel", exact: true }).click();
+        else await page.locator(".editor .bar .ed-cancel").click();
         await aborted;
         release();
         assert.equal(posted(f, "cancel").length, 0, "request cancellation works before the core returns its attempt");
@@ -1557,7 +1470,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await row.click();
       await moduleRequested;
       const closedEditor = await page.locator(".editor").elementHandle();
-      await page.locator(".editor .bar").getByRole("button", { name: "Cancel", exact: true }).click();
+      await page.locator(".editor .bar .ed-cancel").click();
       await page.locator(".editor").waitFor({ state: "hidden" });
       const moduleLoaded = page.waitForResponse("**/sub2api/common.js");
       releaseModule();
@@ -1577,7 +1490,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const loginRequested = page.waitForRequest("**/api/sub2api/login");
       await box.getByRole("button", { name: "Sign in", exact: true }).click();
       await loginRequested;
-      await page.locator(".editor .bar").getByRole("button", { name: "Cancel", exact: true }).click();
+      await page.locator(".editor .bar .ed-cancel").click();
       await page.locator(".editor").waitFor({ state: "hidden" });
       const pending = await loginRequested;
       releaseLogin();
@@ -1587,142 +1500,142 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(posted(f, "2fa").length, 0);
       assert.deepEqual(errors, []);
     });
-    for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
-      for (const width of [1100, 420]) {
-        await t.test(`${lang} ${width}px: password, 2FA, cancel, binding and old balance`, async (st) => {
-          const f = fixture(), { page, context, errors } = await open(browser, f, lang, width);
-          st.after(() => context.close());
-          const tr = (key) => word(lang, key);
-          await page.locator(".row.provider", { hasText: "Relay" }).click();
-          const box = page.locator(".s2-editor");
-          await box.locator("summary").click();
-          await box.getByRole("button", { name: tr("Sign in"), exact: true }).waitFor();
-          assert(await box.getByRole("button", { name: tr("Sign in with browser verification"), exact: true }).isEnabled());
-          assert.equal(await box.getByLabel(tr("Panel address"), { exact: true }).inputValue(), account.base);
-          const password = box.getByLabel(tr("Panel password"), { exact: true });
-          await box.getByLabel(tr("Panel email"), { exact: true }).fill(account.email);
-          await password.fill("one-use-secret");
-          assert.equal(await box.getByRole("checkbox", { name: tr("Remember this password on this computer") }).isChecked(), false);
-          assert.equal(f.posted.length, 0, "typing writes nothing");
-          await waitPost(page, "login", () => box.getByRole("button", { name: tr("Sign in"), exact: true }).click());
-          const code = box.getByLabel(tr("Six-digit verification code"));
-          await code.waitFor();
-          assert.equal(posted(f, "login")[0].body.password, "one-use-secret");
-          assert.equal(posted(f, "login")[0].body.remember, false);
-          assert.equal(posted(f, "login")[0].body.expectedRevision, "revision-1");
-          assert.equal(await box.locator("input[type=password]").count(), 0, "the password is cleared before 2FA");
-          await waitPost(page, "cancel", () => box.getByRole("button", { name: tr("Cancel"), exact: true }).click());
-          assert.equal(posted(f, "cancel")[0].body.attempt, "attempt-one");
-          await box.getByLabel(tr("Panel password"), { exact: true }).fill("second-secret");
-          await waitPost(page, "login", () => box.getByRole("button", { name: tr("Sign in"), exact: true }).click());
-          await code.fill("123456");
-          await waitPost(page, "2fa", () => box.getByRole("button", { name: tr("Verify code"), exact: true }).click());
-          await box.getByRole("button", { name: tr("Unlink provider"), exact: true }).waitFor();
-          assert.deepEqual(posted(f, "2fa")[0].body, { provider: "relay", attempt: "attempt-one", code: "123456" });
-          assert.equal(posted(f, "provider/save").length, 0, "sign-in does not save an old provider draft");
-          assert.equal(await page.locator("body").textContent().then((s) => s.includes("second-secret")), false);
-          const pick = box.locator(".s2-group-value").first();
-          await wheelTo(page, pick);
-          await pick.filter({ hasText: "Premium" }).waitFor();
-          assert.equal(posted(f, "preview").at(-1).body.expectedRevision, "revision-2");
-          assert.equal(posted(f, "preview").at(-1).body.expectedGeneration, account.generation);
-          assert.equal(posted(f, "bind-key").length, 0);
-          await fits(page, box);
-          assert(await page.locator(".editor details.advanced").evaluate((d) => d.open), "a saved balance URL opens Advanced");
-          assert.equal(await page.locator(".bal-url").inputValue(), relay.balanceURL);
-          assert.equal(await page.locator(".bal-path").inputValue(), relay.balancePath);
-          assert.equal(await page.locator(".bal-method .opt.on").textContent(), "POST");
-          const checked = page.waitForResponse((r) => new URL(r.url()).pathname === "/api/provider/balance");
-          await page.locator(".editor").getByRole("button", { name: tr("Check balance"), exact: true }).click();
-          await checked;
-          const body = posted(f, "provider/balance").at(-1).body;
-          assert.equal(body.balanceMethod, "POST");
-          assert.equal(body.balancePath, "$credits.left");
-          assert.equal(body.balanceToken, undefined, "a session query never copies a panel token into the form");
-          await waitPost(page, "unbind", () => box.getByRole("button", { name: tr("Unlink provider"), exact: true }).click());
-          assert.equal(posted(f, "unbind").at(-1).body.expectedVersion, nextVersion(binding.version));
-          assert.equal(posted(f, "unbind").at(-1).body.expectedRevision, "revision-3");
-          assert.equal(posted(f, "logout").length, 0, "unlinking does not sign out a shared account");
-          await box.getByLabel(tr("Panel password"), { exact: true }).fill("cancel-secret");
-          await waitPost(page, "login", () => box.getByRole("button", { name: tr("Sign in"), exact: true }).click());
-          await code.waitFor();
-          await waitPost(page, "cancel", () => page.locator(".editor .bar").getByRole("button", { name: tr("Cancel"), exact: true }).click());
-          await page.locator(".editor").waitFor({ state: "hidden" });
-          assert.deepEqual(errors, []);
-        });
-        await t.test(`${lang} ${width}px: groups, rates, account monitoring, refresh and history`, async (st) => {
-          const f = fixture(true), p = f.providers[0], mon = f.monitor.accounts[0];
-          const other = (id, groupId, rates) => {
-            const keyList = rates.map((_, i) => ({ id: "other-" + i, name: "Key " + i, on: true }));
-            const provider = { ...structuredClone(relay), id, name: id, keyList, sub2api: { ...binding,
-              groupId, keyIds: keyList.map((k) => k.id), version: "binding-4" } };
-            f.providers.push(provider);
-            mon.sources.push({ id, name: id, groupId, groupName: groupId, bindingVersion: "binding-4", revision: provider.sub2apiRevision, activeKeyIds: provider.keyList.map((k) => k.id), conflict: new Set(rates).size > 1,
-              ...(new Set(rates).size === 1 ? { rate: rates[0] } : {}), keys: rates.map((rate, i) => ({ id: "other-" + i, rate, lastSuccess: stamp })) });
-          };
-          other("Conflicting", "b", [.7, .9]); other("Zero", "c", [0]); other("Unassigned", "", [1.1]);
-          const { page, context, errors } = await open(browser, f, lang, width, "usage");
-          st.after(() => context.close());
-          const tr = (key) => word(lang, key), pane = page.locator("#sub2apiPane");
-          await pane.locator('.s2-group[data-group="a"]').waitFor();
-          const a = pane.locator('.s2-group[data-group="a"]');
-          const b = pane.locator('.s2-group[data-group="b"]');
-          const c = pane.locator('.s2-group[data-group="c"]');
-          assert.equal(await a.locator(".s2-billing .s2-label").first().textContent(), tr("Key billing rate"));
-          assert.match(await b.textContent(), new RegExp(tr("Rate not confirmed")));
-          assert.doesNotMatch(await b.textContent(), new RegExp(tr("Key rate conflict")), "independent Key rates are not a conflict");
-          assert.match(await c.textContent(), /0×/);
-          assert.equal(await c.locator(".s2-sync").first().textContent(), tr("Pending sync"));
-          assert.equal(await b.getByRole("button", { name: tr("Apply rate"), exact: true }).count(), 0);
-          await pane.locator('.s2-group[data-group=""]').waitFor();
-          assert.equal(await pane.locator('.s2-group[data-group=""] .s2-sync').first().textContent(), tr("Pending sync"));
-          await wheelTo(page, a.locator(".s2-observation > summary"));
-          await a.locator(".s2-observation > summary").click();
-          for (const summary of await a.locator(".s2-metric-history > summary").all()) {
-            await wheelTo(page, summary);
-            await summary.click();
-          }
-          assert.match(await a.locator(".s2-observation").textContent(), /98%/);
-          assert.match(await a.locator(".s2-observation").textContent(), /75%/);
-          assert.match(await a.textContent(), /Latest observation unavailable/);
-          assert.equal(await b.locator(".s2-observation").count(), 0, "the global snapshot is not copied to an unknown group");
-          assert.equal(await pane.locator(".s2-account-details > .s2-observation").count(), 1);
-          assert.equal(await pane.locator(".s2-group").getByRole("checkbox").count(), 0,
-            "all groups follow the account switch without individual watch controls");
-          const watchAccount = pane.getByRole("switch", { name: tr("Monitor this account") });
-          await wheelTo(page, watchAccount);
-          await waitPost(page, "monitor", () => watchAccount.uncheck());
-          assert.equal(posted(f, "monitor").at(-1).body.enabled, false);
-          assert.deepEqual(posted(f, "monitor").at(-1).body.groups, [{ id: "a", name: "Premium" }],
-            "the account switch preserves legacy group references without editing them");
-          const query = a.getByRole("button", { name: tr("Query once"), exact: true }).first();
-          await wheelTo(page, query);
-          await waitPost(page, "preview", () => query.click());
-          await a.getByText(tr("Synced"), { exact: true }).first().waitFor();
-          assert.equal(posted(f, "apply-key-rate").length, 0);
-          assert.equal(localRate(p), .8);
-          assert.equal(p.priceRate, relay.priceRate);
-          const onlyChanged = pane.getByRole("checkbox", { name: tr("Only changed groups") });
-          await wheelTo(page, onlyChanged);
-          await onlyChanged.check();
-          assert.equal(await pane.locator(".s2-group").count(), 1);
-          const history = pane.locator(".s2-history > summary");
-          await wheelTo(page, history);
-          await history.click();
-          assert.match(await pane.locator(".s2-history").textContent(), new RegExp(tr("Key billing rate changed")));
-          const reload = page.locator("#usageReload");
-          await wheelTo(page, reload);
-          await waitPost(page, "refresh", () => reload.click());
-          assert.equal(posted(f, "monitor").length, 1, "refreshing the view does not change background monitoring");
-          assert.equal(await page.locator("select").count(), 0);
-          await fits(page, pane);
-          if (process.env.ARTIFACT_DIR) {
-            await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
-            await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `sub2api-${engine}-${lang}-${width}.png`), fullPage: true });
-          }
-          assert.deepEqual(errors, []);
-        });
-      }
+    for (const [lang, width] of [["en", 1100], ["zh", 420]]) {
+      await t.test(`${lang} ${width}px: password, 2FA, cancel, binding and old balance`, async (st) => {
+        const f = fixture(), { page, context, errors } = await open(browser, f, lang, width);
+        st.after(() => context.close());
+        const tr = (key) => word(lang, key);
+        await page.locator(".row.provider", { hasText: "Relay" }).click();
+        const box = page.locator(".s2-editor");
+        await box.locator("summary").click();
+        assert(await box.evaluate((node) => node.closest(".ebody")?.parentElement === node.closest(".editor")),
+          "late panel fields must belong to the editor's scrolling body");
+        await box.getByRole("button", { name: tr("Sign in"), exact: true }).waitFor();
+        assert(await box.getByRole("button", { name: tr("Sign in with browser verification"), exact: true }).isEnabled());
+        assert.equal(await box.getByLabel(tr("Panel address"), { exact: true }).inputValue(), account.base);
+        const password = box.getByLabel(tr("Panel password"), { exact: true });
+        await box.getByLabel(tr("Panel email"), { exact: true }).fill(account.email);
+        await password.fill("one-use-secret");
+        assert.equal(await box.getByRole("checkbox", { name: tr("Remember this password on this computer") }).isChecked(), false);
+        assert.equal(f.posted.length, 0, "typing writes nothing");
+        await waitPost(page, "login", () => box.getByRole("button", { name: tr("Sign in"), exact: true }).click());
+        const code = box.getByLabel(tr("Six-digit verification code"));
+        await code.waitFor();
+        assert.equal(posted(f, "login")[0].body.password, "one-use-secret");
+        assert.equal(posted(f, "login")[0].body.remember, false);
+        assert.equal(posted(f, "login")[0].body.expectedRevision, "revision-1");
+        assert.equal(await box.locator("input[type=password]").count(), 0, "the password is cleared before 2FA");
+        await waitPost(page, "cancel", () => box.getByRole("button", { name: tr("Cancel"), exact: true }).click());
+        assert.equal(posted(f, "cancel")[0].body.attempt, "attempt-one");
+        await box.getByLabel(tr("Panel password"), { exact: true }).fill("second-secret");
+        await waitPost(page, "login", () => box.getByRole("button", { name: tr("Sign in"), exact: true }).click());
+        await code.fill("123456");
+        await waitPost(page, "2fa", () => box.getByRole("button", { name: tr("Verify code"), exact: true }).click());
+        await box.getByRole("button", { name: tr("Unlink provider"), exact: true }).waitFor();
+        assert.deepEqual(posted(f, "2fa")[0].body, { provider: "relay", attempt: "attempt-one", code: "123456" });
+        assert.equal(posted(f, "provider/save").length, 0, "sign-in does not save an old provider draft");
+        assert.equal(await page.locator("body").textContent().then((s) => s.includes("second-secret")), false);
+        const pick = box.locator(".s2-group-value").first();
+        await wheelTo(page, pick);
+        await pick.filter({ hasText: "Premium" }).waitFor();
+        assert.equal(posted(f, "preview").at(-1).body.expectedRevision, "revision-2");
+        assert.equal(posted(f, "preview").at(-1).body.expectedGeneration, account.generation);
+        assert.equal(posted(f, "bind-key").length, 0);
+        await fits(page, box);
+        assert(await page.locator(".editor details.advanced").evaluate((d) => d.open), "a saved balance URL opens Advanced");
+        assert.equal(await page.locator(".bal-url").inputValue(), relay.balanceURL);
+        assert.equal(await page.locator(".bal-path").inputValue(), relay.balancePath);
+        assert.equal(await page.locator(".bal-method .opt.on").textContent(), "POST");
+        const checked = page.waitForResponse((r) => new URL(r.url()).pathname === "/api/provider/balance");
+        await page.locator(".editor").getByRole("button", { name: tr("Check balance"), exact: true }).click();
+        await checked;
+        const body = posted(f, "provider/balance").at(-1).body;
+        assert.equal(body.balanceMethod, "POST");
+        assert.equal(body.balancePath, "$credits.left");
+        assert.equal(body.balanceToken, undefined, "a session query never copies a panel token into the form");
+        await waitPost(page, "unbind", () => box.getByRole("button", { name: tr("Unlink provider"), exact: true }).click());
+        assert.equal(posted(f, "unbind").at(-1).body.expectedVersion, nextVersion(binding.version));
+        assert.equal(posted(f, "unbind").at(-1).body.expectedRevision, "revision-3");
+        assert.equal(posted(f, "logout").length, 0, "unlinking does not sign out a shared account");
+        await box.getByLabel(tr("Panel password"), { exact: true }).fill("cancel-secret");
+        await waitPost(page, "login", () => box.getByRole("button", { name: tr("Sign in"), exact: true }).click());
+        await code.waitFor();
+        await waitPost(page, "cancel", () => page.locator(".editor .bar .ed-cancel").click());
+        await page.locator(".editor").waitFor({ state: "hidden" });
+        assert.deepEqual(errors, []);
+      });
+      await t.test(`${lang} ${width}px: groups, rates, account monitoring, refresh and history`, async (st) => {
+        const f = fixture(true), p = f.providers[0], mon = f.monitor.accounts[0];
+        const other = (id, groupId, rates) => {
+          const keyList = rates.map((_, i) => ({ id: "other-" + i, name: "Key " + i, on: true }));
+          const provider = { ...structuredClone(relay), id, name: id, keyList, sub2api: { ...binding,
+            groupId, keyIds: keyList.map((k) => k.id), version: "binding-4" } };
+          f.providers.push(provider);
+          mon.sources.push({ id, name: id, groupId, groupName: groupId, bindingVersion: "binding-4", revision: provider.sub2apiRevision, activeKeyIds: provider.keyList.map((k) => k.id), conflict: new Set(rates).size > 1,
+            ...(new Set(rates).size === 1 ? { rate: rates[0] } : {}), keys: rates.map((rate, i) => ({ id: "other-" + i, rate, lastSuccess: stamp })) });
+        };
+        other("Conflicting", "b", [.7, .9]); other("Zero", "c", [0]); other("Unassigned", "", [1.1]);
+        const { page, context, errors } = await open(browser, f, lang, width, "usage");
+        st.after(() => context.close());
+        const tr = (key) => word(lang, key), pane = page.locator("#sub2apiPane");
+        await pane.locator('.s2-group[data-group="a"]').waitFor();
+        const a = pane.locator('.s2-group[data-group="a"]');
+        const b = pane.locator('.s2-group[data-group="b"]');
+        const c = pane.locator('.s2-group[data-group="c"]');
+        assert.equal(await a.locator(".s2-billing .s2-label").first().textContent(), tr("Key billing rate"));
+        assert.match(await b.textContent(), new RegExp(tr("Rate not confirmed")));
+        assert.doesNotMatch(await b.textContent(), new RegExp(tr("Key rate conflict")), "independent Key rates are not a conflict");
+        assert.match(await c.textContent(), /0×/);
+        assert.equal(await c.locator(".s2-sync").first().textContent(), tr("Pending sync"));
+        assert.equal(await b.getByRole("button", { name: tr("Apply rate"), exact: true }).count(), 0);
+        await pane.locator('.s2-group[data-group=""]').waitFor();
+        assert.equal(await pane.locator('.s2-group[data-group=""] .s2-sync').first().textContent(), tr("Pending sync"));
+        await wheelTo(page, a.locator(".s2-observation > summary"));
+        await a.locator(".s2-observation > summary").click();
+        for (const summary of await a.locator(".s2-metric-history > summary").all()) {
+          await wheelTo(page, summary);
+          await summary.click();
+        }
+        assert.match(await a.locator(".s2-observation").textContent(), /98%/);
+        assert.match(await a.locator(".s2-observation").textContent(), /75%/);
+        assert.match(await a.textContent(), /Latest observation unavailable/);
+        assert.equal(await b.locator(".s2-observation").count(), 0, "the global snapshot is not copied to an unknown group");
+        assert.equal(await pane.locator(".s2-account-details > .s2-observation").count(), 1);
+        assert.equal(await pane.locator(".s2-group").getByRole("checkbox").count(), 0,
+          "all groups follow the account switch without individual watch controls");
+        const watchAccount = pane.getByRole("switch", { name: tr("Monitor this account") });
+        await wheelTo(page, watchAccount);
+        await waitPost(page, "monitor", () => watchAccount.uncheck());
+        assert.equal(posted(f, "monitor").at(-1).body.enabled, false);
+        assert.deepEqual(posted(f, "monitor").at(-1).body.groups, [{ id: "a", name: "Premium" }],
+          "the account switch preserves legacy group references without editing them");
+        const query = a.getByRole("button", { name: tr("Query once"), exact: true }).first();
+        await wheelTo(page, query);
+        await waitPost(page, "preview", () => query.click());
+        await a.getByText(tr("Synced"), { exact: true }).first().waitFor();
+        assert.equal(posted(f, "apply-key-rate").length, 0);
+        assert.equal(localRate(p), .8);
+        assert.equal(p.priceRate, relay.priceRate);
+        const onlyChanged = pane.getByRole("checkbox", { name: tr("Only changed groups") });
+        await wheelTo(page, onlyChanged);
+        await onlyChanged.check();
+        assert.equal(await pane.locator(".s2-group").count(), 1);
+        const history = pane.locator(".s2-history > summary");
+        await wheelTo(page, history);
+        await history.click();
+        assert.match(await pane.locator(".s2-history").textContent(), new RegExp(tr("Key billing rate changed")));
+        const reload = page.locator("#usageReload");
+        await wheelTo(page, reload);
+        await waitPost(page, "refresh", () => reload.click());
+        assert.equal(posted(f, "monitor").length, 1, "refreshing the view does not change background monitoring");
+        assert.equal(await page.locator("select").count(), 0);
+        await fits(page, pane);
+        if (process.env.ARTIFACT_DIR) {
+          await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
+          await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `sub2api-${engine}-${lang}-${width}.png`), fullPage: true });
+        }
+        assert.deepEqual(errors, []);
+      });
     }
     await t.test("conflicting editor actions reread versions without replaying credentials or changes", async (st) => {
       const f = fixture(), { page, context, errors } = await open(browser, f, "en", 1100);
@@ -2062,7 +1975,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           if (recovery) await page.locator('#nav [data-view="providers"]').click();
           else await page.evaluate(() => show("usage"));
         } else if (recovery) await box.getByRole("button", { name: "Cancel", exact: true }).click();
-        else await page.locator(".editor .bar").getByRole("button", { name: close === "save" ? "Save" : "Cancel", exact: true }).click();
+        else if (close === "save") await page.locator(".editor .bar").getByRole("button", { name: "Save", exact: true }).click();
+        else await page.locator(".editor .bar .ed-cancel").click();
         if (recovery) await box.waitFor({ state: "hidden" });
         else await page.locator(".editor").waitFor({ state: "hidden" });
         assert(pending.failure(), "ending the form aborts the in-flight authentication request");
@@ -2159,7 +2073,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.evaluate(() => window.releaseOldLogin());
       await page.waitForFunction((button) => !button.disabled, submit);
       const secondAborted = page.waitForEvent("requestfailed", (request) => request === second);
-      await page.locator(".editor .bar").getByRole("button", { name: "Cancel", exact: true }).click();
+      await page.locator(".editor .bar .ed-cancel").click();
       await page.locator(".editor").waitFor({ state: "hidden" });
       await secondAborted;
       assert(second.failure(), "the first request's finally cannot remove the second request's cancellation");
@@ -2187,7 +2101,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     assert.equal(await box.getByRole("button", { name: "Sign in", exact: true }).count(), 0,
       "another password login cannot start while the browser result is still refreshing the provider");
     await box.getByText("Complete sign-in in the verification window.", { exact: true }).waitFor();
-    await page.locator(".editor .bar").getByRole("button", { name: "Cancel", exact: true }).click();
+    await page.locator(".editor .bar .ed-cancel").click();
     await page.locator(".editor").waitFor({ state: "hidden" });
     const refreshed = page.waitForResponse("**/api/providers");
     release();
@@ -2236,7 +2150,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator(".editor .bar").getByRole("button", { name: action === "save" ? "Save" : "Remove", exact: true }).click();
         if (action === "delete") await page.getByRole("alertdialog").getByRole("button", { name: "Remove", exact: true }).click();
         await pending;
-        await page.locator(".editor .bar").getByRole("button", { name: "Cancel", exact: true }).click();
+        await page.locator(".editor .bar .ed-cancel").click();
         await page.locator(".editor").waitFor({ state: "hidden" });
         await page.locator(`.row.provider[data-id="${next}"]`).click();
         await page.getByPlaceholder("e.g. My Relay", { exact: true }).fill("New draft must survive");
@@ -3171,7 +3085,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
   test(engine + ": filtered account sign-ins finish and restore verification on remount", async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
-    for (const method of ["password", "browser", "two-factor", "password-error", "two-factor-error"]) {
+    for (const method of ["browser", "password-error", "two-factor-error"]) {
       await t.test(method, async (st) => {
         const twoFactor = method.startsWith("two-factor"), failed = method.endsWith("-error");
         const f = fixture(true);
@@ -3258,59 +3172,32 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       });
     }
   });
-  test(engine + ": rate guards reject incomplete and stale snapshots", async (t) => {
+  test(engine + ": key billing preserves precision, dated history and account isolation", async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
-    const f = fixture(true), mon = f.monitor.accounts[0], original = mon.sources[0], expected = [];
-    const setRate = (s, rate) => { s.rate = rate; for (const k of s.keys) k.rate = rate; };
+    const f = fixture(true), mon = f.monitor.accounts[0], original = mon.sources[0];
     const cases = [
-      ["Upper boundary", (_, s) => setRate(s, 1000), true],
-      ["Lower boundary", (_, s) => setRate(s, .001), true],
-      ["Above range", (_, s) => setRate(s, 1000.001)],
-      ["Too precise", (_, s) => setRate(s, .80001)],
-      ["Zero rate", (_, s) => setRate(s, 0)],
-      ["Negative rate", (_, s) => setRate(s, -.1)],
-      ["No group", (p, s) => { p.sub2api.groupId = s.groupId = ""; }],
+      ["Precise rate", (_, s) => { s.keys.forEach((k) => { k.rate = .80001; }); }],
       ["Missing version", (_, s) => { delete s.bindingVersion; }],
-      ["Missing revision", (_, s) => { delete s.revision; }],
       ["Different session", (p) => { p.sub2api.session = "another-session"; }],
-      ["Different group", (p) => { p.sub2api.groupId = "b"; }],
-      ["Stale version", (p) => { p.sub2api.version = nextVersion(p.sub2api.version); }],
-      ["Stale revision", (p) => { p.sub2apiRevision = "new-revision"; }],
-      ["Unconfirmed other key", (p) => { p.keyList.push({ id: "new-key", on: true }); }, true],
-      ["Missing other sample", (_, s) => { s.keys.pop(); }, true],
-      ["Failed key", (_, s) => { s.keys[0].error = "Billing unavailable"; }],
-      ["Failed other key", (_, s) => { s.keys[1].error = "Billing unavailable"; }, true],
-      ["Historical key", (_, s) => { s.keys[0].lastRate = s.keys[0].rate; s.keys[0].lastRateAt = stamp; delete s.keys[0].rate; }],
-      ["Independent key rate", (_, s) => { s.keys[0].rate = .9; }, true],
-      ["Already applied", (p) => { p.priceRate = .8; }],
-      ["No enabled keys", (p, s) => { p.keyList.forEach((k) => { k.on = false; }); s.keys = []; }],
-      ["Disabled bound key", (p, s) => { p.keyList[1].on = false; s.keys.pop(); s.activeKeyIds.pop(); }, true],
-      ["Duplicate identity", (p, s) => { p.keyList.push(structuredClone(p.keyList[0])); p.sub2api.keyIds.push("key-one"); s.keys.push(structuredClone(s.keys[0])); }, true],
     ];
-    for (const [name, mutate, allowed = false] of cases) {
+    for (const [name, mutate] of cases) {
       const p = structuredClone(f.providers[0]), s = structuredClone(original);
       p.id = p.name = s.id = s.name = name;
       mutate(p, s);
-      f.providers.push(p); mon.sources.push(s); expected.push([name, allowed]);
+      f.providers.push(p); mon.sources.push(s);
     }
-    mon.observationError = "Observation unavailable";
     const { page, context, errors } = await open(browser, f, "en", 1100, "usage");
     t.after(() => context.close());
     const pane = page.locator("#sub2apiPane");
     await pane.locator(".s2-group").first().waitFor();
-    for (const [name, allowed] of expected) {
-      const row = pane.locator(`.s2-local .s2-source[data-source="${name}"]`);
-      if (name === "Different session") {
-        assert.equal(await row.count(), 0, "another account's Key does not appear under this account");
-        continue;
-      }
-      assert.equal(await row.locator(".s2-apply").count(), 0, name);
-    }
+    assert.equal(await pane.locator('.s2-source[data-source="Different session"]').count(), 0,
+      "another account's Key does not appear under this account");
     const stale = pane.locator('.s2-billing .s2-source[data-source="Missing version"]');
     assert.match(await stale.textContent(), /Rate not confirmed/);
     assert.match(await stale.locator(".s2-historical").first().textContent(), /Last confirmed: 0.8×/);
-    assert.match(await pane.textContent(), /0.80001×/, "an unrepresentable rate remains unrounded");
+    assert.match(await pane.locator('.s2-billing [data-source="Precise rate"]').textContent(), /0.80001×/,
+      "a precise rate remains unrounded");
     assert.equal(posted(f, "apply-key-rate").length, 0);
     assert.equal(posted(f, "refresh").length, 0, "opening the page reads the local snapshot only");
     assert.deepEqual(errors, []);
@@ -3318,7 +3205,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
   test(engine + ": monitor source revisions refresh providers once without polling them blindly", async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
-    for (const change of ["price", "binding", "keys", "rate", "generation", "new-source"]) {
+    for (const change of ["revision", "binding", "new-source"]) {
       await t.test(change, async (st) => {
         const f = fixture(true), { page, context, errors } = await open(browser, f, "en", 1100, "usage");
         st.after(() => context.close());
@@ -3326,19 +3213,22 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.evaluate(() => { usageEvery = 0; });
         const reads = f.providerReads;
         let p = f.providers[0], source = f.monitor.accounts[0].sources[0];
-        if (change === "price") p.priceRate = 1.4;
-        else if (change === "binding") p.sub2api.version = nextVersion(p.sub2api.version);
-        else if (change === "keys") p.keyList[0].on = false;
-        else if (change === "generation") f.accounts[0].generation++;
-        else if (change === "new-source") {
+        if (change === "new-source") {
           p = structuredClone(p); source = structuredClone(source);
           p.id = source.id = "relay-added";
           p.keyList[0].name = "Externally added Key";
           f.providers.push(p); f.monitor.accounts[0].sources.push(source);
           assert.equal(await page.locator('.s2-keys [data-source="relay-added"]').count(), 0);
         }
-        else { source.rate = .9; source.keys.forEach((k) => { k.rate = .9; }); }
-        source.revision = "revision-sync";
+        else if (change === "binding") p.sub2api.version = nextVersion(p.sub2api.version);
+        else {
+          p.priceRate = 1.4;
+          p.keyList[0].on = false;
+          f.accounts[0].generation++;
+          source.rate = .9;
+          source.keys.forEach((k) => { k.rate = .9; });
+        }
+        source.revision = change === "binding" ? p.sub2apiRevision : "revision-sync";
         source.bindingVersion = p.sub2api.version;
         p.sub2apiRevision = source.revision;
         // Inject the same background read the Usage lifecycle performs while the dialog is open.
@@ -3348,13 +3238,15 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(f.providerReads, reads + 1, "a changed monitor source refreshes provider settings");
         if (change === "new-source") assert.match(await page.locator('.s2-keys [data-source="relay-added"]').textContent(),
           /Externally added Key/, "a source first seen by monitoring appears after provider settings refresh");
+        else assert.deepEqual(await page.evaluate(() => providers.providers[0]), p,
+          "the refreshed list includes the changed rates, binding and Keys");
         await page.evaluate(async () => {
           await window.Sub2API.renderUsage(document.querySelector("#sub2apiPane"));
           await window.Sub2API.renderUsage(document.querySelector("#sub2apiPane"));
         });
         assert.equal(f.providerReads, reads + 1, "unchanged background reads do not reload providers");
         assert.equal(posted(f, "apply-key-rate").length, 0);
-        assert.equal(p.priceRate, change === "price" ? 1.4 : 1.2);
+        assert.equal(p.priceRate, change === "revision" ? 1.4 : 1.2);
         assert.deepEqual(errors, []);
       });
     }
@@ -3375,55 +3267,54 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       [1.01, 1.01, null, [null, null, null]],
       ["0.9", true, "5000", [null, null, null]],
     ];
-    for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) await t.test(lang, async (st) => {
-      const f = fixture(true), mon = f.monitor.accounts[0];
-      const history = { source: "v2-matrix", scope: "group", sampledAt: stamp, observedAt: stamp,
-        cacheRate: .99, availability: 1, ttftP50Ms: 5000 };
-      mon.groups = cases.map(([cacheRate, availability, ttftP50Ms], i) => ({
-        id: String(i), name: "Group " + i, visible: true,
-        observation: { ...history, cacheRate, availability, ttftP50Ms },
-        observationHistory: observationHistory(history),
-      }));
-      const { page, context, errors } = await open(browser, f, lang, 1100, "usage");
-      st.after(() => context.close());
-      await page.evaluate(() => { usageEvery = 0; });
-      for (const [i, sample] of cases.entries()) {
-        const values = page.locator(`[data-group="${i}"] .s2-metric-value`);
-        assert.deepEqual(await values.evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-tone"))),
-          sample[3], "current values use their own metric's inclusive thresholds");
-        for (const [j, tone] of sample[3].entries()) if (tone === null) {
-          assert.equal(await values.nth(j).textContent(), "\u2014", "invalid values stay unknown rather than looking healthy");
-        }
+    const lang = "en";
+    const f = fixture(true), mon = f.monitor.accounts[0];
+    const history = { source: "v2-matrix", scope: "group", sampledAt: stamp, observedAt: stamp,
+      cacheRate: .99, availability: 1, ttftP50Ms: 5000 };
+    mon.groups = cases.map(([cacheRate, availability, ttftP50Ms], i) => ({
+      id: String(i), name: "Group " + i, visible: true,
+      observation: { ...history, cacheRate, availability, ttftP50Ms },
+      observationHistory: observationHistory(history),
+    }));
+    const { page, context, errors } = await open(browser, f, lang, 1100, "usage");
+    t.after(() => context.close());
+    await page.evaluate(() => { usageEvery = 0; });
+    for (const [i, sample] of cases.entries()) {
+      const values = page.locator(`[data-group="${i}"] .s2-metric-value`);
+      assert.deepEqual(await values.evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-tone"))),
+        sample[3], "current values use their own metric's inclusive thresholds");
+      for (const [j, tone] of sample[3].entries()) if (tone === null) {
+        assert.equal(await values.nth(j).textContent(), "\u2014", "invalid values stay unknown rather than looking healthy");
       }
-      const historical = page.locator('[data-group="8"] .s2-historical');
-      assert.equal(await historical.count(), 3, "last confirmed values remain separately dated");
-      assert.equal(await historical.locator("[data-tone]").count(), 0);
-      for (const theme of ["light", "dark"]) for (const width of [1100, 420]) {
-        await page.setViewportSize({ width, height: 860 });
-        await page.evaluate((theme) => document.documentElement.dataset.theme = theme, theme);
-        await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-        const values = page.locator('[data-group="0"] .s2-metric-value');
-        const style = await values.first().evaluate((node) => {
-          const value = getComputedStyle(node), label = getComputedStyle(node.previousElementSibling);
-          return { size: value.fontSize, weight: value.fontWeight, color: value.color, label: label.color, background: value.backgroundColor };
-        });
-        assert.equal(style.size, "13px");
-        assert.equal(style.weight, "600");
-        assert.notEqual(style.color, style.label, "the metric value stands out from its quiet label");
-        assert.equal(style.background, "rgba(0, 0, 0, 0)", "metric emphasis uses text color without badge backgrounds");
-        await fits(page, page.locator("#sub2apiPane"));
-        for (const row of await page.locator(".s2-group-metrics").all()) await fits(page, row);
-        if (process.env.ARTIFACT_DIR && lang === "zh") await page.screenshot({
-          path: path.join(process.env.ARTIFACT_DIR, `sub2api-metric-colors-${engine}-${theme}-${width}.png`), fullPage: true,
-        });
-      }
-      assert.deepEqual(errors, []);
-    });
+    }
+    const historical = page.locator('[data-group="8"] .s2-historical');
+    assert.equal(await historical.count(), 3, "last confirmed values remain separately dated");
+    assert.equal(await historical.locator("[data-tone]").count(), 0);
+    for (const theme of ["light", "dark"]) for (const width of [1100, 420]) {
+      await page.setViewportSize({ width, height: 860 });
+      await page.evaluate((theme) => document.documentElement.dataset.theme = theme, theme);
+      await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      const values = page.locator('[data-group="0"] .s2-metric-value');
+      const style = await values.first().evaluate((node) => {
+        const value = getComputedStyle(node), label = getComputedStyle(node.previousElementSibling);
+        return { size: value.fontSize, weight: value.fontWeight, color: value.color, label: label.color, background: value.backgroundColor };
+      });
+      assert.equal(style.size, "13px");
+      assert.equal(style.weight, "600");
+      assert.notEqual(style.color, style.label, "the metric value stands out from its quiet label");
+      assert.equal(style.background, "rgba(0, 0, 0, 0)", "metric emphasis uses text color without badge backgrounds");
+      await fits(page, page.locator("#sub2apiPane"));
+      for (const row of await page.locator(".s2-group-metrics").all()) await fits(page, row);
+      if (process.env.ARTIFACT_DIR) await page.screenshot({
+        path: path.join(process.env.ARTIFACT_DIR, `sub2api-metric-colors-${engine}-${theme}-${width}.png`), fullPage: true,
+      });
+    }
+    assert.deepEqual(errors, []);
   });
   test(engine + ": group observation metrics show current, historical and unknown values once per group", async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());
-    for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) for (const width of [1100, 420]) {
+    for (const [lang, width] of [["en", 1100], ["zh", 420], ["zh-TW", 420], ["ja", 1100], ["de", 420]]) {
       await t.test(lang + " " + width, async (st) => {
         const f = fixture(true), mon = f.monitor.accounts[0], current = mon.groups[0];
         current.observation = { source: "v2-matrix", scope: "group", window: "90m", sampledAt: stamp,

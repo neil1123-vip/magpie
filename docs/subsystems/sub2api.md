@@ -433,7 +433,12 @@ go test -modfile .tmp-sub2api-wails/go.mod -tags production,sub2api_webview2 ./i
 node --test internal/gui/tests/sub2api.test.cjs
 ```
 
-The browser tests use a local fixture. Run the UI tests in Chromium and
-WebKit, in all five languages, at desktop and narrow widths. Real panel
+The browser tests use a local fixture in Chromium and WebKit. Behavior
+regressions run once per engine, retaining distinct authentication,
+cancellation, conflict and out-of-order response paths. Main flows cover
+English at desktop width and Chinese at narrow width; observation metrics
+cover all five languages at representative widths, with German also checking
+localized rate formatting. Metric thresholds run once across both themes
+and widths instead of repeating the full language/width matrix. Real panel
 sign-in, Cloudflare-to-Go handoff, long-running monitoring and desktop
 notification delivery require separate runtime checks.
